@@ -8,6 +8,7 @@ import re
 from mmpose.apis import MMPoseInferencer
 from shot_detector.utils import parse_shot_csv, get_video_path, identify_player, get_idle_player
 from shot_detector.utils import load_fisheye_params, load_perspective_matrix, transform_points, get_foot_position
+from shot_detector.ball_features import normalize_ball_features, get_ball_feature_names
 
 # Configuration
 SHOTS_CSV_DIRS = [
@@ -22,6 +23,12 @@ OUTPUT_DIR = 'shot_detector/data/'
 MODEL_CONFIG = 'configs/rtmo-s_8xb32-600e_coco-640x640.py'
 MODEL_CHECKPOINT = 'model_weights/rtmo-s_8xb32-600e_coco-640x640-8db55a59_20231211.pth'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Ball trajectory configuration
+BALL_TRAJECTORY_DIR = '/home/carlos/pose_estimators/'
+VIDEO_ID = '0529b769-125d-4a22-bcee-b1707b87447e'
+FRAME_OFFSET = 0  # Trajectories are ~3 frames ahead (tuned from -7)
+MIN_TRAJECTORY_LENGTH = 5  # Minimum frames to consider a trajectory valid (lowered for debugging)
 
 # Calibration constants
 PARAM_DIR = 'parameters'
@@ -493,6 +500,8 @@ def extract_clip_and_pose(video_path, start_frame, duration, inferencer, K=None,
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Failed to open video: {video_path}")
+        if return_all_poses:
+            return None, None, None, None
         return None, None
     
     # Seek to start frame
@@ -631,7 +640,8 @@ def unwrap_bbox(bbox):
     return bbox
 
 def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info=None, 
-                is_forward_filled=False, forward_filled_pose=None, filtering_info=None):
+                is_forward_filled=False, forward_filled_pose=None, filtering_info=None,
+                ball_positions=None, frame_idx_in_clip=None, start_frame=0):
     """
     Draws bounding boxes and labels on the frame.
     
@@ -641,6 +651,9 @@ def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info
         is_forward_filled: If True, active player is forward-filled (show in blue)
         forward_filled_pose: The pose to draw when forward-filling (if None, uses last pose in poses)
         filtering_info: Dict with 'filtered_per_frame' and 'flickering_per_frame' sets of pose indices
+        ball_positions: Dict {frame_number: (x, y, confidence, is_interpolated)} for ball positions
+        frame_idx_in_clip: Current frame index in clip (0-based)
+        start_frame: Starting frame number in video
     """
     img = frame.copy()
     
@@ -777,6 +790,10 @@ def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info
             else:
                 print(f"WARNING: Forward-filled pose has invalid bbox: {bbox}")
         
+        # Draw ball trajectory (MUST be before return!)
+        if ball_positions is not None and len(ball_positions) > 0 and frame_idx_in_clip is not None:
+            draw_ball_trajectory(img, ball_positions, frame_idx_in_clip, start_frame)
+        
         return img
     
     # Original behavior (only filtered poses)
@@ -856,8 +873,196 @@ def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info
                         cv2.circle(img, (kx, ky), 4, color, -1)
         else:
             print(f"WARNING: Forward-filled pose has invalid bbox: {bbox}")
+    
+    # Draw ball trajectory if available (using same approach as extract_clips_with_ball.py)
+    if ball_positions is not None and len(ball_positions) > 0 and frame_idx_in_clip is not None and start_frame is not None:
+        draw_ball_trajectory(img, ball_positions, frame_idx_in_clip, start_frame)
 
     return img
+
+def draw_ball_trajectory(frame, ball_positions, frame_idx_in_clip, start_frame, 
+                        trajectory_color=(255, 255, 0), point_radius=5, trail_length=10):
+    """
+    Draw ball trajectory on frame.
+    IDENTICAL to extract_clips_with_ball.py implementation.
+    
+    Args:
+        frame: Frame to draw on
+        ball_positions: Dict {frame_number: (x, y)} for ball positions
+        frame_idx_in_clip: Current frame index in clip (0-29)
+        start_frame: Starting frame number in video
+        trajectory_color: BGR color for trajectory
+        point_radius: Radius of ball point
+        trail_length: Number of previous frames to show in trail
+    """
+    current_frame_num = start_frame + frame_idx_in_clip
+    
+    # Draw trail (previous frames)
+    trail_frames = []
+    for i in range(max(0, frame_idx_in_clip - trail_length), frame_idx_in_clip):
+        trail_frame_num = start_frame + i
+        if trail_frame_num in ball_positions:
+            trail_frames.append(ball_positions[trail_frame_num])
+    
+    # Draw trail lines
+    for i in range(len(trail_frames) - 1):
+        pt1 = (int(trail_frames[i][0]), int(trail_frames[i][1]))
+        pt2 = (int(trail_frames[i+1][0]), int(trail_frames[i+1][1]))
+        # Fade trail (more recent = brighter)
+        alpha = (i + 1) / len(trail_frames) if len(trail_frames) > 0 else 1.0
+        color = tuple(int(c * alpha) for c in trajectory_color)
+        cv2.line(frame, pt1, pt2, color, 2)
+    
+    # Draw current ball position
+    if current_frame_num in ball_positions:
+        ball_pos = ball_positions[current_frame_num]
+        center = (int(ball_pos[0]), int(ball_pos[1]))
+        # Verify coordinates are within frame bounds
+        h, w = frame.shape[:2]
+        if 0 <= center[0] < w and 0 <= center[1] < h:
+            cv2.circle(frame, center, point_radius, trajectory_color, -1)
+            cv2.circle(frame, center, point_radius + 2, (255, 255, 255), 2)  # White outline
+        else:
+            # Ball is outside frame - draw at edge
+            x = max(0, min(w-1, center[0]))
+            y = max(0, min(h-1, center[1]))
+            cv2.circle(frame, (x, y), point_radius, (0, 0, 255), -1)  # Red if out of bounds
+
+def load_ball_trajectories(ball_csv_path, camera_id=None):
+    """
+    Load ball trajectories from CSV.
+    
+    Args:
+        ball_csv_path: Path to ball trajectory CSV
+        camera_id: Optional camera ID to filter trajectories (e.g., 'BO-0001', 'BO-0002')
+    
+    Returns:
+        dict: {trajectory_id: DataFrame with columns [frame_number, position_x, position_y, confidence, is_interpolated]}
+    """
+    if not os.path.exists(ball_csv_path):
+        return {}
+    
+    df = pd.read_csv(ball_csv_path)
+    
+    # Filter by camera_id if provided
+    if camera_id and 'camera_id' in df.columns:
+        df = df[df['camera_id'] == camera_id].copy()
+        if len(df) == 0:
+            return {}
+    
+    # Group by trajectory_id
+    trajectories = {}
+    for traj_id, group in df.groupby('trajectory_id'):
+        trajectories[traj_id] = group[['frame_number', 'position_x', 'position_y', 'confidence', 'is_interpolated']].copy()
+        trajectories[traj_id] = trajectories[traj_id].sort_values('frame_number')
+    
+    return trajectories
+
+def find_closest_trajectory_to_player(trajectories, player_poses_per_frame, start_frame, duration, 
+                                     min_trajectory_length=15, frame_offset=-7):
+    """
+    Find the ball trajectory that is closest to the active player across the clip.
+    Prefers longest trajectories that are close to the player.
+    """
+    if not trajectories or not player_poses_per_frame:
+        return None
+    
+    # Apply frame offset to start_frame for trajectory matching
+    # If trajectories are ahead (frame_offset negative), we need to look earlier
+    adjusted_start_frame = start_frame + frame_offset
+    adjusted_end_frame = adjusted_start_frame + duration
+    
+    candidate_trajectories = []
+    
+    # Debug: check trajectory frame ranges
+    all_traj_frames = []
+    for traj_id, traj_df in trajectories.items():
+        all_traj_frames.extend(traj_df['frame_number'].tolist())
+    
+    if all_traj_frames:
+        min_traj_frame = min(all_traj_frames)
+        max_traj_frame = max(all_traj_frames)
+        # Only print once per call
+        if len(candidate_trajectories) == 0:  # First iteration
+            pass  # Will print after loop if needed
+    
+    for traj_id, traj_df in trajectories.items():
+        # Filter trajectory to clip frame range (with offset)
+        traj_in_range = traj_df[
+            (traj_df['frame_number'] >= adjusted_start_frame) & 
+            (traj_df['frame_number'] < adjusted_end_frame)
+        ]
+        
+        # Skip if no overlap
+        if len(traj_in_range) == 0:
+            continue
+        
+        total_distance = 0.0
+        valid_frames = 0
+        
+        for i in range(duration):
+            # Video frame number
+            video_frame_num = start_frame + i
+            # Trajectory frame number (with offset)
+            traj_frame_num = adjusted_start_frame + i
+            
+            player_pose = player_poses_per_frame[i] if i < len(player_poses_per_frame) else None
+            
+            if player_pose is None:
+                continue
+            
+            # Get ball position for this trajectory frame (with offset)
+            ball_frame = traj_df[traj_df['frame_number'] == traj_frame_num]
+            if ball_frame.empty:
+                continue
+            
+            ball_pos = np.array([ball_frame.iloc[0]['position_x'], ball_frame.iloc[0]['position_y']])
+            
+            # Get player position (use bbox center)
+            if isinstance(player_pose, dict):
+                bbox = unwrap_bbox(player_pose.get('bbox', []))
+            else:
+                continue
+            
+            if len(bbox) < 4:
+                continue
+            
+            # Use bbox center as player position
+            player_pos = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            
+            # Calculate distance
+            distance = np.linalg.norm(ball_pos - player_pos)
+            total_distance += distance
+            valid_frames += 1
+        
+        # Only consider trajectories with at least some valid frames
+        if valid_frames > 0:
+            avg_distance = total_distance / valid_frames
+            candidate_trajectories.append({
+                'traj_id': traj_id,
+                'avg_distance': avg_distance,
+                'traj_length': len(traj_in_range),
+                'valid_frames': valid_frames
+            })
+        elif len(traj_in_range) > 0:
+            # Even if we couldn't calculate distance (no player poses), still consider it if it overlaps
+            # Use a large default distance
+            candidate_trajectories.append({
+                'traj_id': traj_id,
+                'avg_distance': 10000.0,  # Large default distance
+                'traj_length': len(traj_in_range),
+                'valid_frames': 0
+            })
+    
+    if not candidate_trajectories:
+        return None
+    
+    # Sort by: 1) trajectory length (longer is better), 2) distance (closer is better)
+    # Prefer longest trajectories, then closest ones
+    candidate_trajectories.sort(key=lambda x: (-x['traj_length'], x['avg_distance']))
+    
+    # Return the best trajectory (longest, then closest)
+    return candidate_trajectories[0]['traj_id']
 
 def normalize_keypoints_body_relative(keypoints, image_width, image_height):
     """
@@ -914,12 +1119,18 @@ def normalize_keypoints_body_relative(keypoints, image_width, image_height):
     
     return features
 
-def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=None):
+def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=None, 
+                 ball_positions=None, start_frame=0):
     """
     Saves the pose sequence to a CSV with normalized features.
-    Format: frame_num, left_shoulder_x_body_rel, left_shoulder_y_body_rel, ..., hip_y_abs, hip_x_abs, shoulder_center_y_abs
+    Format: frame_num, left_shoulder_x_body_rel, left_shoulder_y_body_rel, ..., hip_y_abs, hip_x_abs, shoulder_center_y_abs,
+            ball_x_body_rel, ball_y_body_rel, ball_x_abs, ball_y_abs, ball_vx_body_rel, ball_vy_body_rel, ball_visible, ball_confidence
     
     If image_width/height are not provided, falls back to raw keypoint format.
+    
+    Args:
+        ball_positions: Dict {frame_number: (x, y, confidence, is_interpolated)} for ball positions
+        start_frame: Starting frame number in video (for matching ball positions)
     """
     data = []
     
@@ -983,6 +1194,69 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                     row['hip_y_abs'] = features[24]
                     row['hip_x_abs'] = features[25]
                     row['shoulder_center_y_abs'] = features[26]
+                    
+                    # Extract ball features if available
+                    if ball_positions is not None:
+                        video_frame_num = start_frame + frame_idx
+                        ball_data = ball_positions.get(video_frame_num)
+                        
+                        # Get hip center and shoulder width for ball normalization
+                        left_hip = body_kpts_12[6]
+                        right_hip = body_kpts_12[7]
+                        left_shoulder = body_kpts_12[0]
+                        right_shoulder = body_kpts_12[1]
+                        
+                        if not (np.any(np.isnan(left_hip)) or np.any(np.isnan(right_hip))):
+                            hip_center = (left_hip + right_hip) / 2.0
+                        else:
+                            hip_center = np.array([0.0, 0.0])
+                        
+                        if not (np.any(np.isnan(left_shoulder)) or np.any(np.isnan(right_shoulder))):
+                            shoulder_width = np.linalg.norm(right_shoulder - left_shoulder)
+                            if shoulder_width < 1.0:
+                                shoulder_width = 1.0
+                        else:
+                            shoulder_width = 1.0
+                        
+                        # Get previous ball positions for velocity and acceleration
+                        prev_video_frame = start_frame + frame_idx - 1
+                        prev_prev_video_frame = start_frame + frame_idx - 2
+                        prev_ball_data = ball_positions.get(prev_video_frame) if ball_positions else None
+                        prev_prev_ball_data = ball_positions.get(prev_prev_video_frame) if ball_positions else None
+                        
+                        ball_prev_pos = None
+                        ball_prev_prev_pos = None
+                        if prev_ball_data:
+                            ball_prev_pos = np.array([prev_ball_data[0], prev_ball_data[1]])
+                        if prev_prev_ball_data:
+                            ball_prev_prev_pos = np.array([prev_prev_ball_data[0], prev_prev_ball_data[1]])
+                        
+                        # Extract ball features
+                        # ball_positions stores only (x, y) — same as extract_clips_with_ball.py
+                        if ball_data:
+                            ball_pos = np.array([ball_data[0], ball_data[1]])
+                            ball_confidence = 1.0
+                            ball_visible = True
+                        else:
+                            ball_pos = None
+                            ball_confidence = 0.0
+                            ball_visible = False
+                        
+                        ball_features = normalize_ball_features(
+                            ball_pos, ball_prev_pos, hip_center, shoulder_width,
+                            image_width, image_height, ball_visible, ball_confidence,
+                            ball_prev_prev_pos=ball_prev_prev_pos
+                        )
+                        
+                        # Add ball features to row
+                        ball_feature_names = get_ball_feature_names()
+                        for i, feat_name in enumerate(ball_feature_names):
+                            row[feat_name] = ball_features[i]
+                    else:
+                        # No ball data - fill with NaN
+                        ball_feature_names = get_ball_feature_names()
+                        for feat_name in ball_feature_names:
+                            row[feat_name] = np.nan
                 except Exception as e:
                     # If normalization fails, fill with NaN
                     print(f"Warning: Failed to normalize pose at frame {frame_idx}: {e}")
@@ -992,6 +1266,10 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                     row['hip_y_abs'] = np.nan
                     row['hip_x_abs'] = np.nan
                     row['shoulder_center_y_abs'] = np.nan
+                    # Ball features also NaN
+                    ball_feature_names = get_ball_feature_names()
+                    for feat_name in ball_feature_names:
+                        row[feat_name] = np.nan
             else:
                 # Missing pose - fill with NaN
                 for kp_name in BODY_KEYPOINT_NAMES:
@@ -1000,6 +1278,10 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                 row['hip_y_abs'] = np.nan
                 row['hip_x_abs'] = np.nan
                 row['shoulder_center_y_abs'] = np.nan
+                # Ball features also NaN
+                ball_feature_names = get_ball_feature_names()
+                for feat_name in ball_feature_names:
+                    row[feat_name] = np.nan
             data.append(row)
         
     df = pd.DataFrame(data)
@@ -1010,6 +1292,9 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
         for kp_name in BODY_KEYPOINT_NAMES:
             column_order.extend([f'{kp_name}_x_body_rel', f'{kp_name}_y_body_rel'])
         column_order.extend(['hip_y_abs', 'hip_x_abs', 'shoulder_center_y_abs'])
+        # Add ball features
+        ball_feature_names = get_ball_feature_names()
+        column_order.extend(ball_feature_names)
         
         # Reorder columns if they exist
         existing_cols = [col for col in column_order if col in df.columns]
@@ -1041,6 +1326,15 @@ def main():
 
     csv_files = sorted(list(csv_files_map.keys()))
     
+    # Filter to only videos with ball trajectories (0529b769-125d-4a22-bcee-b1707b87447e)
+    csv_files = [f for f in csv_files if VIDEO_ID in f]
+    
+    if not csv_files:
+        print(f"No CSV files found for video ID: {VIDEO_ID}")
+        return
+    
+    print(f"Processing {len(csv_files)} CSV files for video {VIDEO_ID}")
+    
     for csv_file in tqdm(csv_files, desc="Processing CSVs"):
         csv_path = csv_files_map[csv_file]
         
@@ -1059,6 +1353,32 @@ def main():
         K, D, H = get_calibration(video_name)
         if H is None:
             tqdm.write(f"Warning: No perspective matrix found for {video_name}, filtering might be ineffective.")
+        
+        # Load ball trajectories for this video (if available)
+        trajectories = {}
+        if VIDEO_ID in video_name:
+            # Determine camera ID (BO-0001 or BO-0002)
+            # Prioritize video_name since that's the actual video being processed
+            camera_id = None
+            if 'BO-0001' in video_name:
+                camera_id = 'BO-0001'
+            elif 'BO-0002' in video_name:
+                camera_id = 'BO-0002'
+            # Fallback to csv_path if video_name doesn't have camera ID
+            elif 'BO-0001' in csv_path:
+                camera_id = 'BO-0001'
+            elif 'BO-0002' in csv_path:
+                camera_id = 'BO-0002'
+            
+            if camera_id:
+                ball_csv_path = os.path.join(BALL_TRAJECTORY_DIR, f'{VIDEO_ID}_{camera_id}_ball_trajectories.csv')
+            else:
+                ball_csv_path = None
+            
+            if ball_csv_path and os.path.exists(ball_csv_path):
+                trajectories = load_ball_trajectories(ball_csv_path, camera_id=camera_id)
+                if trajectories:
+                    tqdm.write(f"Loaded {len(trajectories)} ball trajectories for {video_name} (camera: {camera_id})")
         
         # Group by row to process each shot
         # Convert to list to use tqdm
@@ -1249,6 +1569,64 @@ def main():
                 
                 tracked_idle_indices[i] = idle_match_idx
 
+            # NOW match ball trajectory to active player (after tracking is complete)
+            # Build active player pose sequence (only active player, not idle/invalid)
+            active_player_poses = []
+            for i in range(len(frames)):
+                act_idx = tracked_active_indices.get(i, -1)
+                if act_idx != -1 and act_idx < len(poses_per_frame[i]):
+                    active_player_poses.append(poses_per_frame[i][act_idx])
+                else:
+                    active_player_poses.append(None)
+            
+            # Match ball trajectory using ONLY active player poses
+            ball_positions = {}
+            if trajectories:
+                best_traj_id = find_closest_trajectory_to_player(
+                    trajectories, active_player_poses, start_frame, duration,
+                    min_trajectory_length=MIN_TRAJECTORY_LENGTH, frame_offset=FRAME_OFFSET
+                )
+                
+                if best_traj_id is not None:
+                    traj_df = trajectories[best_traj_id]
+                    for _, row in traj_df.iterrows():
+                        traj_frame_num = int(row['frame_number'])
+                        # Convert trajectory frame to video frame (subtract offset)
+                        # FRAME_OFFSET is negative (e.g., -7), meaning trajectories are ahead
+                        # So video_frame = traj_frame - FRAME_OFFSET (subtracting negative adds)
+                        video_frame_num = traj_frame_num - FRAME_OFFSET
+                        if start_frame <= video_frame_num < start_frame + duration:
+                            # Store ONLY (x, y) — same as extract_clips_with_ball.py
+                            ball_positions[video_frame_num] = (row['position_x'], row['position_y'])
+                    
+                    # Always print if we have ball data
+                    tqdm.write(f"    ✅ Matched ball trajectory {best_traj_id}: {len(ball_positions)} frames with ball data (clip: {start_frame} to {start_frame+duration})")
+                    # Debug: show sample ball positions
+                    if len(ball_positions) > 0:
+                        sample_frames = sorted(ball_positions.keys())[:3]
+                        for sf in sample_frames:
+                            data = ball_positions[sf]
+                            tqdm.write(f"      Sample frame {sf}: ball at ({int(data[0])}, {int(data[1])})")
+                else:
+                    # Debug: show frame ranges
+                    if trajectories:
+                        all_frames = []
+                        for traj_df in trajectories.values():
+                            all_frames.extend(traj_df['frame_number'].tolist())
+                        if all_frames:
+                            min_traj = min(all_frames)
+                            max_traj = max(all_frames)
+                            adjusted_start = start_frame + FRAME_OFFSET
+                            adjusted_end = adjusted_start + duration
+                            tqdm.write(f"    ❌ No matching ball trajectory found for clip {start_frame} to {start_frame+duration}")
+                            tqdm.write(f"       Looking in trajectory range [{adjusted_start}, {adjusted_end}), trajectories span [{min_traj}, {max_traj}]")
+                        else:
+                            tqdm.write(f"    ❌ No matching ball trajectory found (trajectories empty)")
+                    else:
+                        tqdm.write(f"    ❌ No trajectories available")
+            else:
+                tqdm.write(f"    ⚠️  No trajectories available for this video")
+
             # Generate output with forward-fill for missing frames (max 5 consecutive)
             pose_data_sequence = []  # Active player
             idle_pose_data_sequence = []  # Idle player
@@ -1291,9 +1669,18 @@ def main():
                         'filtered': filtering_info['filtered_per_frame'][i] if i < len(filtering_info['filtered_per_frame']) else set(),
                         'flickering': filtering_info['flickering_per_frame'][i] if i < len(filtering_info['flickering_per_frame']) else set()
                     }
+                # Pass full ball_positions dict for trail drawing
+                # Always verify ball_positions is populated on first frame (critical for debugging)
+                if i == 0:
+                    if ball_positions and len(ball_positions) > 0:
+                        tqdm.write(f"      ✓ Passing ball_positions to draw_overlay: {len(ball_positions)} entries, first frame {start_frame}")
+                    else:
+                        tqdm.write(f"      ⚠️  WARNING - ball_positions is empty or None when calling draw_overlay!")
+                
                 vis_frame = draw_overlay(frame, poses, act_idx, idl_idx, debug=DEBUG_MODE, 
                                         all_poses_info=all_poses_info, is_forward_filled=is_forward_filled,
-                                        forward_filled_pose=forward_filled_pose, filtering_info=frame_filtering_info)
+                                        forward_filled_pose=forward_filled_pose, filtering_info=frame_filtering_info,
+                                        ball_positions=ball_positions, frame_idx_in_clip=i, start_frame=start_frame)
                 if out is not None:
                     out.write(vis_frame)
                 
@@ -1343,16 +1730,20 @@ def main():
                         img_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         cap.release()
             
-            # Save active player pose CSV
+            # Save active player pose CSV (with ball features)
+            # Note: ball_positions was already matched earlier for video visualization
             pose_csv_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}_pose.csv"
             save_pose_csv(pose_data_sequence, os.path.join(OUTPUT_DIR, pose_csv_filename), 
-                         image_width=img_width, image_height=img_height)
+                         image_width=img_width, image_height=img_height,
+                         ball_positions=ball_positions if ball_positions else None,
+                         start_frame=start_frame)
             
-            # Save idle player pose CSV (if we have idle data)
+            # Save idle player pose CSV (if we have idle data, no ball for idle)
             if any(p is not None for p in idle_pose_data_sequence):
                 idle_pose_csv_filename = f"{video_name}_{center_frame}_idle_{player_label}_pose.csv"
                 save_pose_csv(idle_pose_data_sequence, os.path.join(OUTPUT_DIR, idle_pose_csv_filename), 
-                             image_width=img_width, image_height=img_height)
+                             image_width=img_width, image_height=img_height,
+                             ball_positions=None, start_frame=start_frame)
 
 if __name__ == "__main__":
     main()

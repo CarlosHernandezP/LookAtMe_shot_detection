@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
 from sklearn.metrics import (
@@ -19,6 +18,8 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score, accuracy_score
 )
 import joblib
+import xgboost as xgb
+from shot_detector.ball_features import get_ball_feature_names
 from tqdm import tqdm
 import json
 from datetime import datetime
@@ -53,6 +54,10 @@ for kp_name in BODY_KEYPOINT_NAMES:
     EXPECTED_FEATURE_COLS.extend([f'{kp_name}_x_body_rel', f'{kp_name}_y_body_rel'])
 EXPECTED_FEATURE_COLS.extend(['hip_y_abs', 'hip_x_abs', 'shoulder_center_y_abs'])
 
+# Add ball feature columns (8 features)
+BALL_FEATURE_COLS = get_ball_feature_names()
+EXPECTED_FEATURE_COLS.extend(BALL_FEATURE_COLS)  # Now 27 + 10 = 37 total features
+
 SEQUENCE_LENGTH = 30  # 30 frames per sequence
 
 
@@ -68,7 +73,8 @@ def load_pose_csv(pose_csv_path: str) -> Optional[np.ndarray]:
     Returns
     -------
     np.ndarray or None
-        Array of shape (num_frames, 27) with pose features, or None if invalid
+        Array of shape (num_frames, 35) with pose + ball features, or None if invalid
+        (27 pose features + 8 ball features)
     """
     try:
         df = pd.read_csv(pose_csv_path)
@@ -84,12 +90,38 @@ def load_pose_csv(pose_csv_path: str) -> Optional[np.ndarray]:
             return None
         
         # Extract features in exact order
-        features = df[EXPECTED_FEATURE_COLS].values
+        # Check which columns exist (ball features may be missing in old files)
+        available_cols = [col for col in EXPECTED_FEATURE_COLS if col in df.columns]
+        missing_cols = [col for col in EXPECTED_FEATURE_COLS if col not in df.columns]
         
-        # Handle NaN values
-        features_df = pd.DataFrame(features)
-        features_df = features_df.ffill().bfill().fillna(0)  # Forward fill, backward fill, then zero
+        if missing_cols:
+            # Some features missing - create DataFrame with NaN for missing columns
+            features_df = df[available_cols].copy()
+            for col in missing_cols:
+                features_df[col] = np.nan
+            # Reorder to match EXPECTED_FEATURE_COLS
+            features_df = features_df[EXPECTED_FEATURE_COLS]
+        else:
+            features_df = df[EXPECTED_FEATURE_COLS].copy()
+        
         features = features_df.values
+        
+        # Handle NaN values for pose features only (forward/backward fill)
+        # Ball features: keep NaN (XGBoost can handle NaN)
+        pose_features = features[:, :27]  # First 27 are pose features
+        ball_features = features[:, 27:] if features.shape[1] > 27 else np.full((features.shape[0], len(BALL_FEATURE_COLS)), np.nan)
+        
+        # Fill NaN for pose features only
+        pose_df = pd.DataFrame(pose_features)
+        pose_df = pose_df.ffill().bfill().fillna(0)  # Forward fill, backward fill, then zero
+        pose_features = pose_df.values
+        
+        # Combine: pose features (filled) + ball features (NaN preserved)
+        if features.shape[1] > 27:
+            features = np.hstack([pose_features, ball_features])
+        else:
+            # No ball features in this file - add NaN columns
+            features = np.hstack([pose_features, np.full((features.shape[0], len(BALL_FEATURE_COLS)), np.nan)])
         
         # Check for too many NaN values (>50%)
         nan_ratio = np.isnan(features).sum() / features.size
@@ -129,8 +161,7 @@ def validate_sequence(sequence: np.ndarray) -> bool:
     
     T, D = sequence.shape
     
-    # Check dimensions
-    if D != 27:
+    if D != 37 and D != 27:
         return False
     
     # Check for too many NaN values
@@ -229,12 +260,27 @@ def load_training_data(data_dir: str, shot_mapping: Optional[Dict] = None,
             skip_reasons['invalid_sequence'] += 1
             continue
         
+        # Only use sequences with ball data (35 features = 27 pose + 8 ball)
+        # Check if we have ball features and they're not all NaN
+        if features.shape[1] < 37:
+            skipped += 1
+            skip_reasons['no_ball_data'] = skip_reasons.get('no_ball_data', 0) + 1
+            continue
+        
+        # Check if ball features have any non-NaN values in ANY frame
+        ball_features = features[:, 27:37]
+        if np.all(np.isnan(ball_features)):
+            skipped += 1
+            skip_reasons['no_ball_data'] = skip_reasons.get('no_ball_data', 0) + 1
+            continue
+        
         sequences_list.append(features)
         labels_list.append(class_name)
     
     if skipped > 0:
         print(f"\nSkipped {skipped} files:")
-        print(f"  - No shot type extracted: {skip_reasons['no_shot_type']}")
+        print(f"  - No shot type extracted: {skip_reasons.get('no_shot_type', 0)}")
+        print(f"  - No ball data: {skip_reasons.get('no_ball_data', 0)}")
         print(f"  - Unmapped shot type: {skip_reasons['unmapped']}")
         print(f"  - Load failed: {skip_reasons['load_failed']}")
         print(f"  - Invalid sequence: {skip_reasons['invalid_sequence']}")
@@ -257,21 +303,25 @@ def load_training_data(data_dir: str, shot_mapping: Optional[Dict] = None,
     return sequences, labels
 
 
-def train_random_forest(
+def train_xgboost_classifier(
     data_dir: str,
     output_dir: str = "model_weights",
     shot_mapping: Optional[Dict] = None,
     use_augmentation: bool = True,
     augmentation_config: Optional[Dict] = None,
     n_estimators: int = 100,
-    max_depth: Optional[int] = None,
+    max_depth: Optional[int] = 6,
     random_state: int = 42,
     cv_folds: int = 5,
-    class_weight: Optional[str] = 'balanced',
-    test_size: float = 0.2
-) -> Tuple[RandomForestClassifier, LabelEncoder]:
+    scale_pos_weight: Optional[float] = None,  # For class imbalance (auto-calculated if None)
+    test_size: float = 0.2,
+    learning_rate: float = 0.1,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8
+) -> Tuple[xgb.XGBClassifier, LabelEncoder]:
     """
-    Train Random Forest classifier for shot detection.
+    Train XGBoost classifier for shot detection.
+    XGBoost can handle NaN values natively, so missing ball data is preserved as NaN.
     
     Parameters
     ----------
@@ -286,20 +336,24 @@ def train_random_forest(
     augmentation_config : dict, optional
         Augmentation configuration
     n_estimators : int
-        Number of trees in Random Forest (default: 100)
+        Number of boosting rounds (default: 100)
     max_depth : int, optional
-        Maximum depth of trees (default: None = unlimited)
+        Maximum depth of trees (default: 6)
     random_state : int
         Random seed for reproducibility
     cv_folds : int
         Number of cross-validation folds (default: 5)
-    class_weight : str or None, optional
-        Class weight strategy. Options:
-        - 'balanced': Automatically adjust weights inversely proportional to class frequencies
-        - 'balanced_subsample': Same as 'balanced' but computed for each bootstrap sample
-        - None: No class weighting (default: 'balanced')
+    scale_pos_weight : float, optional
+        Controls the balance of positive and negative weights. 
+        If None, will be calculated automatically from class distribution (default: None)
     test_size : float
         Proportion of dataset to include in the test split (default: 0.2 = 20%)
+    learning_rate : float
+        Learning rate (default: 0.1)
+    subsample : float
+        Subsample ratio of training instances (default: 0.8)
+    colsample_bytree : float
+        Subsample ratio of columns when constructing each tree (default: 0.8)
         
     Returns
     -------
@@ -375,33 +429,50 @@ def train_random_forest(
         count = counts_test[unique_test == cls_idx][0] if len(counts_test[unique_test == cls_idx]) > 0 else 0
         print(f"  {cls_name}: {count} samples")
     
-    # Train Random Forest on training data
-    print("\nTraining Random Forest on training set...")
+    # Calculate scale_pos_weight for class imbalance (if not provided)
+    if scale_pos_weight is None:
+        # Calculate from training data class distribution
+        unique_classes, class_counts = np.unique(y_train, return_counts=True)
+        if len(unique_classes) == 2:
+            # Binary classification: scale_pos_weight = negative_count / positive_count
+            negative_count = class_counts[0]
+            positive_count = class_counts[1]
+            scale_pos_weight = negative_count / positive_count if positive_count > 0 else 1.0
+            print(f"\nCalculated scale_pos_weight: {scale_pos_weight:.4f} (for class imbalance)")
+        else:
+            # Multi-class: use sum of all other classes / current class (average)
+            total_samples = len(y_train)
+            scale_pos_weight = 1.0  # Default for multi-class
+            print(f"\nMulti-class classification, using default scale_pos_weight: {scale_pos_weight}")
+    else:
+        print(f"\nUsing provided scale_pos_weight: {scale_pos_weight:.4f}")
     
-    # Calculate class weights if needed
-    if class_weight == 'balanced':
-        print(f"Using balanced class weights to handle imbalanced dataset")
-    elif class_weight == 'balanced_subsample':
-        print(f"Using balanced_subsample class weights (per bootstrap sample)")
-    elif class_weight is None:
-        print(f"No class weighting (may bias toward majority classes)")
+    # Train XGBoost on training data
+    print("\nTraining XGBoost classifier on training set...")
+    print(f"Note: XGBoost can handle NaN values natively (missing ball data preserved as NaN)")
     
-    rf_model = RandomForestClassifier(
+    xgb_model = xgb.XGBClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        scale_pos_weight=scale_pos_weight,
         random_state=random_state,
-        class_weight=class_weight,
+        tree_method='hist',  # Faster training
+        enable_categorical=False,
         n_jobs=-1,
-        verbose=1
+        verbosity=1
     )
     
-    rf_model.fit(X_train, y_train)
+    # XGBoost can handle NaN natively - no need to impute
+    xgb_model.fit(X_train, y_train)
     
     # Cross-validation on TRAINING data only (for model selection/hyperparameter tuning)
     print("\nPerforming cross-validation on TRAINING data...")
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-    cv_scores = cross_val_score(rf_model, X_train, y_train, cv=cv, scoring='accuracy')
-    cv_balanced_scores = cross_val_score(rf_model, X_train, y_train, cv=cv, scoring='balanced_accuracy')
+    cv_scores = cross_val_score(xgb_model, X_train, y_train, cv=cv, scoring='accuracy')
+    cv_balanced_scores = cross_val_score(xgb_model, X_train, y_train, cv=cv, scoring='balanced_accuracy')
     
     print(f"\nCross-validation results on training data ({cv_folds}-fold):")
     print(f"  Mean accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
@@ -413,12 +484,12 @@ def train_random_forest(
     print("\n" + "="*80)
     print("EVALUATING ON TEST SET (unseen data)")
     print("="*80)
-    y_test_pred = rf_model.predict(X_test)
-    y_test_pred_proba = rf_model.predict_proba(X_test)
+    y_test_pred = xgb_model.predict(X_test)
+    y_test_pred_proba = xgb_model.predict_proba(X_test)
     
     # Also evaluate on training set for comparison
-    y_train_pred = rf_model.predict(X_train)
-    y_train_pred_proba = rf_model.predict_proba(X_train)
+    y_train_pred = xgb_model.predict(X_train)
+    y_train_pred_proba = xgb_model.predict_proba(X_train)
     
     # Calculate comprehensive metrics on TEST set
     test_accuracy = accuracy_score(y_test, y_test_pred)
@@ -507,7 +578,7 @@ def train_random_forest(
     print(classification_report(y_test, y_test_pred, target_names=label_encoder.classes_))
     
     # Feature importance
-    feature_importance = rf_model.feature_importances_
+    feature_importance = xgb_model.feature_importances_
     feature_names = get_feature_names(27)
     top_indices = np.argsort(feature_importance)[-20:][::-1]
     print("\nTop 20 Most Important Features:")
@@ -526,11 +597,11 @@ def train_random_forest(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    model_path = output_path / "random_forest_model_cv.pkl"
+    model_path = output_path / "xgboost_model_cv.pkl"
     encoder_path = output_path / "label_encoder_rf_cv.pkl"
     
     print(f"\nSaving model to {model_path}")
-    joblib.dump(rf_model, model_path)
+    joblib.dump(xgb_model, model_path)
     
     print(f"Saving label encoder to {encoder_path}")
     joblib.dump(label_encoder, encoder_path)
@@ -553,7 +624,7 @@ def train_random_forest(
     print(f"\nTraining report saved to {results_dir}/")
     print("\nTraining complete!")
     
-    return rf_model, label_encoder
+    return xgb_model, label_encoder
 
 
 def analyze_misclassifications(y_true: np.ndarray, y_pred: np.ndarray, 
@@ -1062,13 +1133,13 @@ def main():
         '--n-estimators',
         type=int,
         default=100,
-        help='Number of trees in Random Forest (default: 100)'
+        help='Number of boosting rounds in XGBoost (default: 100)'
     )
     parser.add_argument(
         '--max-depth',
         type=int,
-        default=None,
-        help='Maximum depth of trees (default: None = unlimited)'
+        default=6,
+        help='Maximum depth of trees (default: 6)'
     )
     parser.add_argument(
         '--cv-folds',
@@ -1077,11 +1148,10 @@ def main():
         help='Number of cross-validation folds (default: 5)'
     )
     parser.add_argument(
-        '--class-weight',
-        type=str,
-        default='balanced',
-        choices=['balanced', 'balanced_subsample', 'none'],
-        help='Class weight strategy: "balanced" (default), "balanced_subsample", or "none"'
+        '--scale-pos-weight',
+        type=float,
+        default=None,
+        help='Scale positive weight for class imbalance (auto-calculated if None, default: None)'
     )
     parser.add_argument(
         '--test-size',
@@ -1091,9 +1161,6 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Convert 'none' to None for class_weight parameter
-    class_weight = None if args.class_weight == 'none' else args.class_weight
     
     if args.discover_shots:
         discover_shot_types(args.data_dir)
@@ -1108,7 +1175,7 @@ def main():
         'reverse': False
     }
     
-    train_random_forest(
+    train_xgboost_classifier(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         use_augmentation=not args.no_augmentation,
@@ -1116,7 +1183,7 @@ def main():
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         cv_folds=args.cv_folds,
-        class_weight=class_weight,
+        scale_pos_weight=args.scale_pos_weight,
         test_size=args.test_size
     )
 

@@ -129,7 +129,8 @@ def parse_shot_csv(csv_path):
 def get_video_path(csv_path, videos_dirs):
     """
     Infers video path from csv path or content.
-    Handles 'annotation_' prefix and suffix like '_1'.
+    Handles 'annotation_' prefix and suffix like '_period1', '_period2', '_1'.
+    Matches video by camera ID (BO-0001 or BO-0002) extracted from annotation filename.
     Searches in a list of video directories.
     """
     filename = os.path.basename(csv_path)
@@ -140,8 +141,18 @@ def get_video_path(csv_path, videos_dirs):
     if base.startswith("annotation_"):
         base = base[len("annotation_"):]
         
-    # Remove suffix like "_1", "_2"
-    if '_' in base:
+    # Extract camera ID (BO-0001 or BO-0002) from the filename
+    camera_id = None
+    if 'BO-0001' in base:
+        camera_id = 'BO-0001'
+    elif 'BO-0002' in base:
+        camera_id = 'BO-0002'
+    
+    # Remove period suffix like "_period1", "_period2", "_period3"
+    if '_period' in base:
+        base = base.split('_period')[0]
+    # Also remove numeric suffix like "_1", "_2" if it's at the end
+    elif '_' in base:
         parts = base.rsplit('_', 1)
         if len(parts) == 2 and parts[1].isdigit():
             base = parts[0]
@@ -150,10 +161,23 @@ def get_video_path(csv_path, videos_dirs):
     if isinstance(videos_dirs, str):
         videos_dirs = [videos_dirs]
         
+    # First, try exact match with base name
     for d in videos_dirs:
         if not os.path.exists(d): continue
         for ext in ['.mp4', '.mov', '.avi']:
             vid_path = os.path.join(d, base + ext)
+            if os.path.exists(vid_path):
+                return vid_path
+    
+    # If camera_id was found, try to match by camera ID
+    if camera_id:
+        for d in videos_dirs:
+            if not os.path.exists(d): continue
+            # List all videos in directory and find one matching the camera ID
+            for f in os.listdir(d):
+                if f.endswith(('.mp4', '.mov', '.avi')):
+                    if camera_id in f:
+                        vid_path = os.path.join(d, f)
             if os.path.exists(vid_path):
                 return vid_path
             

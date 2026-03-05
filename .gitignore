@@ -4,3 +4,10 @@
 _venv_
 _env_
 *.lock
+*.txt
+*.json
+variables*
+*.pb
+*.png
+*.zip
+*.python-version
