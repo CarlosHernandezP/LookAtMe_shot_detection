@@ -1,0 +1,22 @@
+[project]
+name = "pose-estimators"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mediapipe>=0.10.21",
+    "opencv-python>=4.11.0.86",
+    "openmim>=0.3.9",
+    "platformdirs>=4.4.0",
+    "setuptools>=80.9.0",
+    "tensorflow>=2.18.1",
+    "tensorflow-hub>=0.16.1",
+    "tomli>=2.3.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
+    "ultralytics>=8.3.233",
+]
+[tool.uv.extra-build-dependencies]
+chumpy = ["pip"]

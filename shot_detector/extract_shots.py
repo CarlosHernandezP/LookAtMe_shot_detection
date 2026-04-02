@@ -5,6 +5,8 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 import re
+import argparse
+import json
 from mmpose.apis import MMPoseInferencer
 from shot_detector.utils import parse_shot_csv, get_video_path, identify_player, get_idle_player
 from shot_detector.utils import load_fisheye_params, load_perspective_matrix, transform_points, get_foot_position
@@ -26,9 +28,26 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Ball trajectory configuration
 BALL_TRAJECTORY_DIR = '/home/carlos/pose_estimators/'
-VIDEO_ID = '0529b769-125d-4a22-bcee-b1707b87447e'
-FRAME_OFFSET = 0  # Trajectories are ~3 frames ahead (tuned from -7)
-MIN_TRAJECTORY_LENGTH = 5  # Minimum frames to consider a trajectory valid (lowered for debugging)
+FRAME_OFFSET = 0
+MIN_TRAJECTORY_LENGTH = 5
+
+# Map: video name substring -> (trajectory CSV filename, camera_id or None)
+# camera_id=None means the trajectory file already contains only one camera
+BALL_TRAJECTORY_MAP = {
+    '0529b769-125d-4a22-bcee-b1707b87447e': {
+        'BO-0001': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0001_ball_trajectories.csv',
+        'BO-0002': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0002_ball_trajectories.csv',
+    },
+    '15-11-2025-15-57_rpi-BO-0001': {
+        'BO-0001': '15-11-2025_ball_trajectories.csv',
+    },
+    '22-11-2025-18-10_rpi-LU-0002': {
+        'LU-0002': '22-11-2025_ball_trajectories.csv',
+    },
+}
+
+# Which annotation CSVs to process (None = all available)
+VIDEO_FILTER = None
 
 # Calibration constants
 PARAM_DIR = 'parameters'
@@ -1303,9 +1322,74 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
     
     df.to_csv(output_path, index=False)
 
+
+def load_resume_state(state_path):
+    """Load extraction resume state from JSON file."""
+    if not os.path.exists(state_path):
+        return {'processed_shots': [], 'completed_csv_files': []}
+    try:
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+        state.setdefault('processed_shots', [])
+        state.setdefault('completed_csv_files', [])
+        return state
+    except Exception:
+        return {'processed_shots': [], 'completed_csv_files': []}
+
+
+def save_resume_state(state_path, state):
+    """Persist extraction resume state atomically."""
+    tmp_path = f"{state_path}.tmp"
+    with open(tmp_path, 'w') as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp_path, state_path)
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Extract shot clips and pose CSVs")
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=OUTPUT_DIR,
+        help=f'Output directory for generated files (default: {OUTPUT_DIR})'
+    )
+    parser.add_argument(
+        '--resume-state',
+        type=str,
+        default=None,
+        help='Path to resume state JSON (default: <output-dir>/extraction_state.json)'
+    )
+    parser.add_argument(
+        '--no-video',
+        action='store_true',
+        help='Do not save MP4 clips; export CSV only'
+    )
+    parser.add_argument(
+        '--video-filter',
+        type=str,
+        default=None,
+        help='Comma-separated list of video key substrings to process'
+    )
+    parser.add_argument(
+        '--max-csv-files',
+        type=int,
+        default=None,
+        help='Process only the first N annotation CSVs after filters (smoke test / partial run)',
+    )
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+    video_filter_runtime = None
+    if args.video_filter:
+        video_filter_runtime = [v.strip() for v in args.video_filter.split(',') if v.strip()]
+
+    state_path = args.resume_state or os.path.join(output_dir, 'extraction_state.json')
+    state = load_resume_state(state_path)
+    processed_shots = set(state.get('processed_shots', []))
+    completed_csv_files = set(state.get('completed_csv_files', []))
+
     # Ensure output directories exist
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     # Initialize MMPose
     inferencer = init_mmpose()
@@ -1326,16 +1410,29 @@ def main():
 
     csv_files = sorted(list(csv_files_map.keys()))
     
-    # Filter to only videos with ball trajectories (0529b769-125d-4a22-bcee-b1707b87447e)
-    csv_files = [f for f in csv_files if VIDEO_ID in f]
+    # Filter to only videos that have ball trajectory data
+    active_video_filter = video_filter_runtime if video_filter_runtime is not None else VIDEO_FILTER
+    if active_video_filter is not None:
+        csv_files = [f for f in csv_files if any(vid_key in f for vid_key in active_video_filter)]
+    else:
+        trajectory_keys = list(BALL_TRAJECTORY_MAP.keys())
+        csv_files = [f for f in csv_files if any(vid_key in f for vid_key in trajectory_keys)]
     
     if not csv_files:
-        print(f"No CSV files found for video ID: {VIDEO_ID}")
+        print(f"No CSV files found matching trajectory map keys: {list(BALL_TRAJECTORY_MAP.keys())}")
         return
+
+    if args.max_csv_files is not None and args.max_csv_files > 0:
+        csv_files = csv_files[: args.max_csv_files]
+        print(f"Limited to first {len(csv_files)} CSV file(s) (--max-csv-files)")
     
-    print(f"Processing {len(csv_files)} CSV files for video {VIDEO_ID}")
+    print(f"Processing {len(csv_files)} CSV files with ball trajectories available")
     
     for csv_file in tqdm(csv_files, desc="Processing CSVs"):
+        if csv_file in completed_csv_files:
+            tqdm.write(f"Skipping already completed CSV file: {csv_file}")
+            continue
+
         csv_path = csv_files_map[csv_file]
         
         df = parse_shot_csv(csv_path)
@@ -1356,37 +1453,47 @@ def main():
         
         # Load ball trajectories for this video (if available)
         trajectories = {}
-        if VIDEO_ID in video_name:
-            # Determine camera ID (BO-0001 or BO-0002)
-            # Prioritize video_name since that's the actual video being processed
+        matched_key = None
+        for vid_key in BALL_TRAJECTORY_MAP:
+            if vid_key in video_name or vid_key in csv_path:
+                matched_key = vid_key
+                break
+        
+        if matched_key:
+            cam_map = BALL_TRAJECTORY_MAP[matched_key]
+            # Find matching camera ID from video name or csv path
             camera_id = None
-            if 'BO-0001' in video_name:
-                camera_id = 'BO-0001'
-            elif 'BO-0002' in video_name:
-                camera_id = 'BO-0002'
-            # Fallback to csv_path if video_name doesn't have camera ID
-            elif 'BO-0001' in csv_path:
-                camera_id = 'BO-0001'
-            elif 'BO-0002' in csv_path:
-                camera_id = 'BO-0002'
+            for cam_id in cam_map:
+                if cam_id in video_name or cam_id in csv_path:
+                    camera_id = cam_id
+                    break
+            # If only one camera in the map, use it
+            if camera_id is None and len(cam_map) == 1:
+                camera_id = list(cam_map.keys())[0]
             
-            if camera_id:
-                ball_csv_path = os.path.join(BALL_TRAJECTORY_DIR, f'{VIDEO_ID}_{camera_id}_ball_trajectories.csv')
-            else:
-                ball_csv_path = None
-            
-            if ball_csv_path and os.path.exists(ball_csv_path):
-                trajectories = load_ball_trajectories(ball_csv_path, camera_id=camera_id)
-                if trajectories:
-                    tqdm.write(f"Loaded {len(trajectories)} ball trajectories for {video_name} (camera: {camera_id})")
+            if camera_id and camera_id in cam_map:
+                ball_csv_path = os.path.join(BALL_TRAJECTORY_DIR, cam_map[camera_id])
+                if os.path.exists(ball_csv_path):
+                    trajectories = load_ball_trajectories(ball_csv_path, camera_id=camera_id)
+                    if trajectories:
+                        tqdm.write(f"Loaded {len(trajectories)} ball trajectories for {video_name} (camera: {camera_id})")
+                else:
+                    tqdm.write(f"Warning: trajectory file not found: {ball_csv_path}")
         
         # Group by row to process each shot
         # Convert to list to use tqdm
         rows = list(df.iterrows())
+        total_rows = len(rows)
+        completed_rows = 0
         for idx, row in tqdm(rows, desc=f"Shots in {csv_file}", leave=False):
             shot_type = row['Shot']
             center_frame = int(row['FrameId'])
             player_label = row['Player']
+            shot_key = f"{csv_file}::{idx}::{center_frame}::{shot_type}::{player_label}"
+
+            if shot_key in processed_shots:
+                completed_rows += 1
+                continue
             
             # Frame range: 15 before, center, 14 after = 30 frames
             # Start = center - 15
@@ -1636,11 +1743,11 @@ def main():
             consecutive_lost_idle_frames = 0
             MAX_FORWARD_FILL = 5
             
-            # Create output video
-            if frames:
+            # Create output video (optional)
+            if (not args.no_video) and frames:
                 h, w = frames[0].shape[:2]
                 clip_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}.mp4"
-                clip_path = os.path.join(OUTPUT_DIR, clip_filename)
+                clip_path = os.path.join(output_dir, clip_filename)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(clip_path, fourcc, 30.0, (w, h))
             else:
@@ -1733,17 +1840,32 @@ def main():
             # Save active player pose CSV (with ball features)
             # Note: ball_positions was already matched earlier for video visualization
             pose_csv_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}_pose.csv"
-            save_pose_csv(pose_data_sequence, os.path.join(OUTPUT_DIR, pose_csv_filename), 
+            save_pose_csv(pose_data_sequence, os.path.join(output_dir, pose_csv_filename), 
                          image_width=img_width, image_height=img_height,
                          ball_positions=ball_positions if ball_positions else None,
                          start_frame=start_frame)
             
-            # Save idle player pose CSV (if we have idle data, no ball for idle)
+            # Save idle player pose CSV (if we have idle data).
+            # We pass the same ball_positions so idle samples also get ball features
+            # normalized w.r.t. the idle player's body (consistent with non-idle CSVs).
             if any(p is not None for p in idle_pose_data_sequence):
                 idle_pose_csv_filename = f"{video_name}_{center_frame}_idle_{player_label}_pose.csv"
-                save_pose_csv(idle_pose_data_sequence, os.path.join(OUTPUT_DIR, idle_pose_csv_filename), 
+                save_pose_csv(idle_pose_data_sequence, os.path.join(output_dir, idle_pose_csv_filename), 
                              image_width=img_width, image_height=img_height,
-                             ball_positions=None, start_frame=start_frame)
+                             ball_positions=ball_positions if ball_positions else None,
+                             start_frame=start_frame)
+
+            # Mark shot as completed and persist immediately for crash-safe resume.
+            processed_shots.add(shot_key)
+            state['processed_shots'] = sorted(processed_shots)
+            save_resume_state(state_path, state)
+            completed_rows += 1
+
+        # CSV file completed end-to-end.
+        if completed_rows >= total_rows:
+            completed_csv_files.add(csv_file)
+            state['completed_csv_files'] = sorted(completed_csv_files)
+            save_resume_state(state_path, state)
 
 if __name__ == "__main__":
     main()
