@@ -17,9 +17,10 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 
 # 5. Install Base Dependencies (PyTorch, OpenCV, etc.)
+# setuptools>=82 removed pkg_resources; openmim/mim still imports it — pin below 82.
 echo "Installing PyTorch and base deps..."
 uv pip install "torch==2.1.0" "torchvision==0.16.0" --index-url https://download.pytorch.org/whl/cu121
-uv pip install opencv-python tqdm openmim setuptools tomli platformdirs packaging
+uv pip install "setuptools>=70,<82" opencv-python tqdm openmim tomli platformdirs packaging
 
 # 6. Install MM-Libraries Dependencies manually (skip chumpy for now if possible, install munkres)
 echo "Installing helper deps..."
@@ -33,11 +34,15 @@ mim install "mmcv==2.1.0"
 mim install "mmdet>=3.1.0,<3.3.0"
 
 # Install mmpose without deps to avoid chumpy build failure, since we installed critical deps manually
-pip install --no-deps "mmpose>=1.1.0"
+uv pip install --no-deps "mmpose>=1.1.0"
 
 # 8. Force Numpy Downgrade (Binary compatibility fix)
 echo "Downgrading Numpy to <2.0..."
-pip install "numpy<2.0"
+uv pip install "numpy<2.0"
+
+# 9. Shot classifier retraining (XGBoost on pose CSVs)
+echo "Installing training stack for shot_detector/train_shot_model.py..."
+uv pip install "xgboost>=2.0" "scikit-learn>=1.3" matplotlib joblib
 
 echo "========================================"
 echo "Environment setup complete!"

@@ -1,5 +1,10 @@
 #!/bin/bash
 # After extraction finishes, train the flat XGBoost shot classifier.
+#
+# To retrain from Shot_classifier_data.zip only (no live extraction): unzip the
+# archive and sync CSVs into shot_detector/data_csv_only/ (the zip uses
+# Shot_classifier_data/data_csv_only/*.csv). If extract_shots is not running,
+# the wait loop below exits immediately, then training runs as usual.
 
 set -e
 cd "$(dirname "$0")"
