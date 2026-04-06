@@ -17,7 +17,7 @@ while pgrep -f "python.*extract_shots" >/dev/null 2>&1; do
 done
 
 echo "Training (5-fold CV + full-data export)..."
-uv run python shot_detector/train_shot_model.py \
+uv run --no-sync python shot_detector/train_shot_model.py \
   --data-dir shot_detector/data_csv_only \
   --output-dir shot_detector/retrain_results_wall_flat \
   --cv-folds 5 \
