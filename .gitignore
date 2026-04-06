@@ -1,4 +1,5 @@
-*.csv
+Shot_classifier_data/*
+shot_detector/data_csv_only/*
 *.mp4
 *__pycache__*
 _venv_

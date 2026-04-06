@@ -13,21 +13,25 @@ from shot_detector.utils import load_fisheye_params, load_perspective_matrix, tr
 from shot_detector.ball_features import normalize_ball_features, get_ball_feature_names
 
 # Configuration
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 SHOTS_CSV_DIRS = [
     'shot_csvs/shots_csvs/',
-    '/home/daniele/shots_csvs/'
+    '/home/daniele/shots_csvs/',
+    '/home/ec2-user/data/shot_annotations/',
 ]
 VIDEOS_DIRS = [
     'videos/',
-    '/home/daniele/videos/'
+    '/home/daniele/videos/',
+    '/home/ec2-user/data/',
+    '/home/ec2-user/data/matches/',
 ]
 OUTPUT_DIR = 'shot_detector/data/'
 MODEL_CONFIG = 'configs/rtmo-s_8xb32-600e_coco-640x640.py'
 MODEL_CHECKPOINT = 'model_weights/rtmo-s_8xb32-600e_coco-640x640-8db55a59_20231211.pth'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Ball trajectory configuration
-BALL_TRAJECTORY_DIR = '/home/carlos/pose_estimators/'
+# Ball trajectory configuration (defaults to repo root; place CSVs next to pyproject.toml)
+BALL_TRAJECTORY_DIR = _REPO_ROOT
 FRAME_OFFSET = 0
 MIN_TRAJECTORY_LENGTH = 5
 
@@ -35,7 +39,7 @@ MIN_TRAJECTORY_LENGTH = 5
 # camera_id=None means the trajectory file already contains only one camera
 BALL_TRAJECTORY_MAP = {
     '0529b769-125d-4a22-bcee-b1707b87447e': {
-        'BO-0001': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0001_ball_trajectories.csv',
+        'BO-0001': 'ball_trajectories_0529b769-125d-4a22-bcee-b1707b87447e_BO-0001.csv',
         'BO-0002': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0002_ball_trajectories.csv',
     },
     '15-11-2025-15-57_rpi-BO-0001': {
@@ -1376,6 +1380,12 @@ def main():
         default=None,
         help='Process only the first N annotation CSVs after filters (smoke test / partial run)',
     )
+    parser.add_argument(
+        '--max-shots',
+        type=int,
+        default=None,
+        help='Stop after this many shots have been fully exported (clips + CSV)',
+    )
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -1428,7 +1438,12 @@ def main():
     
     print(f"Processing {len(csv_files)} CSV files with ball trajectories available")
     
+    shots_exported = 0
+    stop_extraction = False
+
     for csv_file in tqdm(csv_files, desc="Processing CSVs"):
+        if stop_extraction:
+            break
         if csv_file in completed_csv_files:
             tqdm.write(f"Skipping already completed CSV file: {csv_file}")
             continue
@@ -1860,6 +1875,11 @@ def main():
             state['processed_shots'] = sorted(processed_shots)
             save_resume_state(state_path, state)
             completed_rows += 1
+            shots_exported += 1
+            if args.max_shots is not None and args.max_shots > 0 and shots_exported >= args.max_shots:
+                tqdm.write(f"Stopping: reached --max-shots ({args.max_shots})")
+                stop_extraction = True
+                break
 
         # CSV file completed end-to-end.
         if completed_rows >= total_rows:
