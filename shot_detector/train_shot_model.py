@@ -4,6 +4,8 @@ Train flat XGBoost on pose CSVs (``DEFAULT_SHOT_MAPPING``).
 - ``--cv-folds N``: stratified K-fold CV, metrics JSON, plots (mean±std).
 - Default without CV: single train/val split.
 - By default: trains on full data and exports ``flat_wall_shot_xgb.joblib`` + label encoder.
+- ``--auto-select-features``: one importance probe, then CV macro-F1 over ``--feature-select-grid``
+  to pick K (mutually exclusive with ``--select-top-k-features``).
 """
 
 import sys
@@ -17,7 +19,8 @@ import argparse
 import csv
 import json
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import xgboost as xgb
@@ -34,6 +37,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 
+from shot_detector.ball_features import get_ball_feature_names
 from shot_detector.pose_io import N_FEATURES_RAW, load_pose_csv, pad_or_trim_sequence as _pad_or_trim
 from shot_detector.shot_mapper import (
     DEFAULT_SHOT_MAPPING,
@@ -45,13 +49,27 @@ import glob
 import os
 
 
+XGB_DEFAULTS = {
+    "n_estimators": 220,
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+}
+
+# Module-level override set by main() from CLI flags so make_xgb call sites
+# don't all need to be plumbed.
+_XGB_HP_OVERRIDE: dict = {}
+
+
 def make_xgb(n_classes: int, random_state: int = 42) -> xgb.XGBClassifier:
+    src = {**XGB_DEFAULTS, **_XGB_HP_OVERRIDE}
     params = dict(
-        n_estimators=220,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=int(src["n_estimators"]),
+        max_depth=int(src["max_depth"]),
+        learning_rate=float(src["learning_rate"]),
+        subsample=float(src["subsample"]),
+        colsample_bytree=float(src["colsample_bytree"]),
         random_state=random_state,
         tree_method="hist",
         n_jobs=-1,
@@ -95,28 +113,69 @@ def compute_sample_weights(
     return sw
 
 
-def load_dataset_wall_flat(data_dir: str, min_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+def _read_include_path_set(list_path: Path) -> Set[str]:
+    lines = list_path.read_text(encoding="utf-8").splitlines()
+    out: Set[str] = set()
+    for line in lines:
+        line = line.strip()
+        if line:
+            out.add(os.path.normpath(os.path.abspath(line)))
+    return out
+
+
+def load_dataset_wall_flat(
+    data_dir: str,
+    min_samples: int,
+    include_lists_dir: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    active_allow: Optional[Set[str]] = None
+    idle_allow: Optional[Set[str]] = None
+    if include_lists_dir:
+        base = Path(include_lists_dir).resolve()
+        inc_active = base / "include_pose_csvs.txt"
+        inc_idle = base / "include_idle_pose_csvs.txt"
+        if not inc_active.is_file():
+            raise FileNotFoundError(
+                f"--include-lists-dir expects include_pose_csvs.txt at {inc_active}"
+            )
+        active_allow = _read_include_path_set(inc_active)
+        if inc_idle.is_file():
+            idle_allow = _read_include_path_set(inc_idle)
+        else:
+            idle_allow = None
+
     files = sorted(glob.glob(os.path.join(data_dir, "*_pose.csv")))
     sequences, labels = [], []
 
     for path in files:
+        path_abs = os.path.normpath(os.path.abspath(path))
         raw = extract_shot_type_from_filename(path)
         if not raw:
             continue
         mapped = map_shot_to_class(raw, DEFAULT_SHOT_MAPPING)
         if mapped is None:
             continue
+        if mapped == "idle":
+            if idle_allow is not None and path_abs not in idle_allow:
+                continue
+        else:
+            if active_allow is not None and path_abs not in active_allow:
+                continue
         features = load_pose_csv(path)
         if features is None or features.shape[1] < N_FEATURES_RAW:
             continue
         features = _pad_or_trim(features[:, :N_FEATURES_RAW])
-        if mapped != "idle" and np.all(np.isnan(features[:, 27:37])):
+        n_ball = len(get_ball_feature_names())
+        if mapped != "idle" and np.all(np.isnan(features[:, -n_ball:])):
             continue
         sequences.append(features)
         labels.append(mapped)
 
     if not sequences:
-        raise ValueError(f"No usable pose CSVs in {data_dir}")
+        hint = ""
+        if include_lists_dir:
+            hint = " (check --include-lists-dir paths match --data-dir)"
+        raise ValueError(f"No usable pose CSVs in {data_dir}{hint}")
 
     sequences = np.array(sequences)
     labels = np.array(labels)
@@ -190,6 +249,236 @@ def fold_metrics_dict(
         out["wall_shot_recall"] = float(w["recall"])
         out["wall_shot_f1"] = float(w["f1-score"])
     return out
+
+
+def _fit_probe_column_order_desc(
+    X: np.ndarray,
+    labels: np.ndarray,
+    serve_mult: float,
+    non_idle_mult: float,
+    weight_scheme: str,
+    selection_train_fraction: float = 0.8,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, LabelEncoder]:
+    """
+    Train a probe XGB on a stratified data fraction; return column indices sorted by
+    decreasing ``feature_importances_`` (global ranking for top-K subsets).
+    """
+    le = LabelEncoder()
+    y_enc = le.fit_transform(labels)
+    X_tr, _, y_tr, _ = train_test_split(
+        X,
+        y_enc,
+        train_size=float(selection_train_fraction),
+        stratify=y_enc,
+        random_state=random_state,
+    )
+    probe = make_xgb(len(le.classes_), random_state=random_state)
+    sw = compute_sample_weights(
+        y_tr, le.classes_, serve_mult, non_idle_mult, weight_scheme=weight_scheme
+    )
+    probe.fit(X_tr, y_tr, sample_weight=sw)
+    imp = probe.feature_importances_
+    order = np.argsort(-imp).astype(int)
+    return order, le
+
+
+def _indices_top_k_from_order(order: np.ndarray, k: int, n_cols: int) -> np.ndarray:
+    k_use = min(int(k), n_cols)
+    return np.sort(order[:k_use])
+
+
+def mean_cv_f1_macro(
+    X: np.ndarray,
+    y_enc: np.ndarray,
+    class_names: np.ndarray,
+    n_classes: int,
+    n_folds: int,
+    serve_mult: float,
+    non_idle_mult: float,
+    weight_scheme: str,
+    random_state: int = 42,
+) -> float:
+    """Stratified CV mean validation macro-F1 (same weighting as main training)."""
+    cv = build_cv(n_folds, y_enc)
+    scores: List[float] = []
+    for fi, (tr, va) in enumerate(cv.split(X, y_enc)):
+        model = make_xgb(n_classes, random_state=random_state + fi + 7000)
+        sw = compute_sample_weights(
+            y_enc[tr], class_names, serve_mult, non_idle_mult, weight_scheme=weight_scheme
+        )
+        model.fit(X[tr], y_enc[tr], sample_weight=sw)
+        pred_va = model.predict(X[va])
+        scores.append(
+            float(f1_score(y_enc[va], pred_va, average="macro", zero_division=0))
+        )
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def auto_select_k_by_cv(
+    X: np.ndarray,
+    labels: np.ndarray,
+    k_grid: List[int],
+    tune_cv_folds: int,
+    serve_mult: float,
+    non_idle_mult: float,
+    weight_scheme: str,
+    selection_train_fraction: float,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, float], Dict]:
+    """
+    Single global importance ranking (probe on holdout), then for each K in grid
+    evaluate mean macro-F1 on stratified CV; pick K with best score (tie: larger K).
+    """
+    n_cols = X.shape[1]
+    order, _ = _fit_probe_column_order_desc(
+        X,
+        labels,
+        serve_mult,
+        non_idle_mult,
+        weight_scheme,
+        selection_train_fraction=selection_train_fraction,
+        random_state=random_state,
+    )
+    le = LabelEncoder()
+    y_enc = le.fit_transform(labels)
+    class_names = le.classes_
+    n_classes = len(class_names)
+
+    candidates = sorted({min(max(1, int(k)), n_cols) for k in k_grid})
+    if n_cols not in candidates:
+        candidates.append(n_cols)
+    candidates = sorted(set(candidates))
+
+    scores: Dict[int, float] = {}
+    for k in candidates:
+        idx = _indices_top_k_from_order(order, k, n_cols)
+        Xk = X[:, idx]
+        scores[k] = mean_cv_f1_macro(
+            Xk,
+            y_enc,
+            class_names,
+            n_classes,
+            tune_cv_folds,
+            serve_mult,
+            non_idle_mult,
+            weight_scheme,
+            random_state=random_state,
+        )
+
+    k_best = sorted(scores.items(), key=lambda kv: (-kv[1], -kv[0]))[0][0]
+    idx_best = _indices_top_k_from_order(order, k_best, n_cols)
+    detail = {
+        "method": "xgboost_importance_top_k_cv_tuned",
+        "tune_cv_folds": int(tune_cv_folds),
+        "grid_scores": {str(k): float(v) for k, v in sorted(scores.items())},
+        "k_best": int(k_best),
+        "k_best_mean_val_macro_f1": float(scores[k_best]),
+        "selection_train_fraction": float(selection_train_fraction),
+        "n_temporal_features_before": int(n_cols),
+        "indices": idx_best.tolist(),
+    }
+    return X[:, idx_best], idx_best, scores, detail
+
+
+def select_features_mrmr_top_k(
+    X: np.ndarray,
+    labels: np.ndarray,
+    k: int,
+    selection_train_fraction: float = 0.8,
+    random_state: int = 42,
+    relevance: str = "f",
+    redundancy: str = "c",
+    denominator: str = "mean",
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Maximum-relevance minimum-redundancy feature selection via the `mrmr-selection`
+    pypi library (mrmr.mrmr_classif).
+
+    Defaults: relevance='f' (F-statistic), redundancy='c' (Pearson correlation),
+    denominator='mean' — i.e., classical MRMR.
+
+    Picks K features on a stratified subsample (--selection-train-fraction) to keep
+    cost bounded. Returns (X_reduced, sorted-indices, debug-meta).
+    """
+    import pandas as pd
+    from mrmr import mrmr_classif
+
+    n_cols = X.shape[1]
+    k_use = min(int(k), n_cols)
+    if k_use >= n_cols:
+        return X, np.arange(n_cols, dtype=int), {"shortcut": "k>=n_cols"}
+
+    le = LabelEncoder()
+    y_enc = le.fit_transform(labels)
+    X_tr, _, y_tr, _ = train_test_split(
+        X,
+        y_enc,
+        train_size=float(selection_train_fraction),
+        stratify=y_enc,
+        random_state=random_state,
+    )
+
+    # mrmr's F-statistic / Pearson math can't handle NaN; ball features may be NaN
+    # for clips without ball detections. Impute with 0 for selection only — the
+    # downstream XGBoost model still sees the original NaN-containing X.
+    X_sel = np.nan_to_num(X_tr, nan=0.0, posinf=0.0, neginf=0.0)
+    df = pd.DataFrame(X_sel, columns=[str(i) for i in range(n_cols)])
+    y_ser = pd.Series(y_tr, name="target")
+
+    selected_cols = mrmr_classif(
+        X=df,
+        y=y_ser,
+        K=k_use,
+        relevance=relevance,
+        redundancy=redundancy,
+        denominator=denominator,
+        show_progress=False,
+    )
+    selected_idx = np.array(sorted(int(c) for c in selected_cols), dtype=int)
+
+    meta = {
+        "library": "mrmr-selection",
+        "relevance": relevance,
+        "redundancy": redundancy,
+        "denominator": denominator,
+        "k_returned": int(len(selected_idx)),
+    }
+    return X[:, selected_idx], selected_idx, meta
+
+
+def select_features_xgb_importance_top_k(
+    X: np.ndarray,
+    labels: np.ndarray,
+    k: int,
+    serve_mult: float,
+    non_idle_mult: float,
+    weight_scheme: str,
+    selection_train_fraction: float = 0.8,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    One-shot filter: train XGB on a stratified fraction of rows, take top-k columns by
+    ``feature_importances_``, return X[:, idx] with idx sorted ascending (stable column order).
+
+    If k >= n_columns, returns (X, np.arange(n_columns)).
+    """
+    n_cols = X.shape[1]
+    k_use = min(int(k), n_cols)
+    if k_use >= n_cols:
+        return X, np.arange(n_cols, dtype=int)
+
+    order, _ = _fit_probe_column_order_desc(
+        X,
+        labels,
+        serve_mult,
+        non_idle_mult,
+        weight_scheme,
+        selection_train_fraction=selection_train_fraction,
+        random_state=random_state,
+    )
+    idx = _indices_top_k_from_order(order, k_use, n_cols)
+    return X[:, idx], idx
 
 
 def build_cv(n_folds: int, y: np.ndarray) -> StratifiedKFold:
@@ -408,6 +697,13 @@ def run_single_split(
 def main():
     parser = argparse.ArgumentParser(description="Flat multiclass: train/val or CV + full-data export")
     parser.add_argument("--data-dir", type=str, default="shot_detector/data_csv_only")
+    parser.add_argument(
+        "--include-lists-dir",
+        type=str,
+        default=None,
+        help="Folder with include_pose_csvs.txt (and optionally include_idle_pose_csvs.txt) "
+        "from filter_clips_by_track_metrics; restricts which CSVs are loaded",
+    )
     parser.add_argument("--output-dir", type=str, default="shot_detector/retrain_results_wall_flat")
     parser.add_argument(
         "--cv-folds",
@@ -435,14 +731,181 @@ def main():
         dest="save_model",
         help="Skip final fit on all data and skip exporting joblib artifacts (default: export)",
     )
+    parser.add_argument(
+        "--select-top-k-features",
+        type=int,
+        default=None,
+        help="If set and < temporal width: keep top-K columns by XGB importance (probe fit on "
+        "stratified --selection-train-fraction of data); CV + final model use reduced X",
+    )
+    parser.add_argument(
+        "--selection-train-fraction",
+        type=float,
+        default=0.8,
+        help="Stratified train fraction used only for importance probe (default 0.8)",
+    )
+    parser.add_argument(
+        "--auto-select-features",
+        action="store_true",
+        help="Pick K by CV macro-F1 over --feature-select-grid (same XGB importance ranking as "
+        "manual top-K); uses --feature-select-cv-folds for tuning (independent of --cv-folds)",
+    )
+    parser.add_argument(
+        "--feature-select-grid",
+        type=str,
+        default="80,120,160,200,240,280,320,360,400,440,480,533",
+        help="Comma-separated K values tried when --auto-select-features (clamped to n columns; "
+        "full width is always appended)",
+    )
+    parser.add_argument(
+        "--feature-select-cv-folds",
+        type=int,
+        default=3,
+        help="Stratified folds for scoring each K when --auto-select-features (default 3)",
+    )
+    parser.add_argument(
+        "--feature-select-method",
+        type=str,
+        choices=["xgb_importance", "mrmr"],
+        default="xgb_importance",
+        help="Selector used by --select-top-k-features. xgb_importance = top-K by XGB "
+        "feature_importances_ (greedy); mrmr = max-relevance min-redundancy (MI vs target, "
+        "Pearson redundancy among picks). Ignored under --auto-select-features.",
+    )
+    parser.add_argument(
+        "--feature-indices-json",
+        type=str,
+        default=None,
+        help="Path to a JSON file containing a list of integer column indices into the "
+        "post-`extract_temporal_features` matrix. When set, BOTH --select-top-k-features "
+        "and --auto-select-features are bypassed; the indices are applied verbatim. "
+        "Use to lock in a previously-discovered subset and sweep only the model HPs.",
+    )
+    parser.add_argument("--xgb-n-estimators", type=int, default=XGB_DEFAULTS["n_estimators"])
+    parser.add_argument("--xgb-max-depth", type=int, default=XGB_DEFAULTS["max_depth"])
+    parser.add_argument("--xgb-learning-rate", type=float, default=XGB_DEFAULTS["learning_rate"])
+    parser.add_argument("--xgb-subsample", type=float, default=XGB_DEFAULTS["subsample"])
+    parser.add_argument("--xgb-colsample-bytree", type=float, default=XGB_DEFAULTS["colsample_bytree"])
     args = parser.parse_args()
+
+    manual_k = args.select_top_k_features is not None and args.select_top_k_features > 0
+    if args.auto_select_features and manual_k:
+        parser.error("Use either --auto-select-features or --select-top-k-features, not both")
+    if args.feature_indices_json and (args.auto_select_features or manual_k):
+        parser.error("--feature-indices-json is mutually exclusive with --auto-select-features / --select-top-k-features")
+
+    _XGB_HP_OVERRIDE.update({
+        "n_estimators": args.xgb_n_estimators,
+        "max_depth": args.xgb_max_depth,
+        "learning_rate": args.xgb_learning_rate,
+        "subsample": args.xgb_subsample,
+        "colsample_bytree": args.xgb_colsample_bytree,
+    })
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seqs, lbls = load_dataset_wall_flat(args.data_dir, args.min_samples)
+    seqs, lbls = load_dataset_wall_flat(
+        args.data_dir,
+        args.min_samples,
+        include_lists_dir=args.include_lists_dir,
+    )
     X = extract_temporal_features(seqs[:, :, :N_FEATURES_RAW])
+    n_temporal_before = int(X.shape[1])
     print(f"Temporal features: {X.shape}")
+
+    feat_sel_meta: Optional[Dict] = None
+    if args.feature_indices_json:
+        idx_path = Path(args.feature_indices_json)
+        if not idx_path.exists():
+            parser.error(f"--feature-indices-json file not found: {idx_path}")
+        raw_idx = json.loads(idx_path.read_text())
+        if not isinstance(raw_idx, list) or not all(isinstance(i, int) for i in raw_idx):
+            parser.error(f"--feature-indices-json must contain a JSON list of ints")
+        sel_idx = np.sort(np.asarray(raw_idx, dtype=int))
+        if sel_idx.min() < 0 or sel_idx.max() >= n_temporal_before:
+            parser.error(
+                f"--feature-indices-json indices out of range "
+                f"[0, {n_temporal_before}): saw min={int(sel_idx.min())} max={int(sel_idx.max())}"
+            )
+        X = X[:, sel_idx]
+        feat_sel_meta = {
+            "method": "preselected_indices",
+            "k_requested": int(len(sel_idx)),
+            "k_applied": int(len(sel_idx)),
+            "indices": sel_idx.tolist(),
+            "n_temporal_features_before": n_temporal_before,
+            "source_json": str(idx_path),
+        }
+        print(f"Feature selection [preselected]: kept {len(sel_idx)}/{n_temporal_before} temporal columns -> {X.shape}")
+    elif args.auto_select_features:
+        k_grid = [int(p.strip()) for p in args.feature_select_grid.split(",") if p.strip()]
+        if not k_grid:
+            parser.error("--feature-select-grid must list at least one integer K")
+        if args.feature_select_cv_folds < 2:
+            parser.error("--feature-select-cv-folds must be >= 2")
+        X, sel_idx, _scores, feat_sel_meta = auto_select_k_by_cv(
+            X,
+            lbls,
+            k_grid,
+            tune_cv_folds=args.feature_select_cv_folds,
+            serve_mult=args.serve_weight_mult,
+            non_idle_mult=args.non_idle_weight_mult,
+            weight_scheme=args.weight_scheme,
+            selection_train_fraction=args.selection_train_fraction,
+            random_state=42,
+        )
+        print(
+            f"Auto feature selection: best K={feat_sel_meta['k_best']} "
+            f"(mean val macro-F1={feat_sel_meta['k_best_mean_val_macro_f1']:.4f}, "
+            f"{args.feature_select_cv_folds}-fold tuning) -> {X.shape}"
+        )
+        print("  K    mean_val_macro_f1")
+        for kk, vv in sorted(
+            ((int(k), float(v)) for k, v in feat_sel_meta["grid_scores"].items()),
+            key=lambda t: t[0],
+        ):
+            mark = " *" if kk == feat_sel_meta["k_best"] else ""
+            print(f"  {kk:<4} {vv:.4f}{mark}")
+    elif args.select_top_k_features is not None and args.select_top_k_features > 0:
+        if args.select_top_k_features < n_temporal_before:
+            if args.feature_select_method == "mrmr":
+                X, sel_idx, mrmr_meta = select_features_mrmr_top_k(
+                    X,
+                    lbls,
+                    args.select_top_k_features,
+                    selection_train_fraction=args.selection_train_fraction,
+                    random_state=42,
+                )
+                feat_sel_meta = {
+                    "method": "mrmr_classif_top_k",
+                    "k_requested": int(args.select_top_k_features),
+                    "k_applied": int(len(sel_idx)),
+                    "indices": sel_idx.tolist(),
+                    "n_temporal_features_before": n_temporal_before,
+                    "selection_train_fraction": float(args.selection_train_fraction),
+                    "mrmr_debug": mrmr_meta,
+                }
+            else:
+                X, sel_idx = select_features_xgb_importance_top_k(
+                    X,
+                    lbls,
+                    args.select_top_k_features,
+                    serve_mult=args.serve_weight_mult,
+                    non_idle_mult=args.non_idle_weight_mult,
+                    weight_scheme=args.weight_scheme,
+                    selection_train_fraction=args.selection_train_fraction,
+                    random_state=42,
+                )
+                feat_sel_meta = {
+                    "method": "xgboost_importance_top_k",
+                    "k_requested": int(args.select_top_k_features),
+                    "k_applied": int(len(sel_idx)),
+                    "indices": sel_idx.tolist(),
+                    "n_temporal_features_before": n_temporal_before,
+                    "selection_train_fraction": float(args.selection_train_fraction),
+                }
+            print(f"Feature selection [{feat_sel_meta['method']}]: kept {len(sel_idx)}/{n_temporal_before} temporal columns -> {X.shape}")
 
     if args.export_counts:
         counts_path = out_dir / "aggregated_class_counts.csv"
@@ -464,9 +927,11 @@ def main():
             idle_min_prob=args.idle_min_prob,
             weight_scheme=args.weight_scheme,
         )
+        if feat_sel_meta is not None:
+            report.setdefault("config", {})["feature_selection"] = feat_sel_meta
         json_path = out_dir / "flat_wall_shot_cv_report.json"
         with open(json_path, "w") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, default=str)
 
         pfs = report["cv"]["per_fold_mean_std"]
         print(f"\n=== {report['cv']['n_folds']}-fold CV: global mean ± std ===")
@@ -507,9 +972,11 @@ def main():
             idle_min_prob=args.idle_min_prob,
             weight_scheme=args.weight_scheme,
         )
+        if feat_sel_meta is not None:
+            report.setdefault("config", {})["feature_selection"] = feat_sel_meta
         json_path = out_dir / "flat_wall_shot_report.json"
         with open(json_path, "w") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, default=str)
 
         vm = report["validation"]
         sp = report["split"]
@@ -550,9 +1017,14 @@ def main():
             "classes": le.classes_.tolist(),
             "weight_scheme": args.weight_scheme,
             "n_samples": int(len(lbls)),
+            "n_features_raw": int(N_FEATURES_RAW),
+            "n_temporal_features": int(X.shape[1]),
             "trained_on": "full_dataset",
             "metrics_report": json_path.name,
+            "include_lists_dir": args.include_lists_dir,
         }
+        if feat_sel_meta is not None:
+            meta["feature_selection"] = feat_sel_meta
         with open(out_dir / "flat_wall_shot_model_meta.json", "w") as f:
             json.dump(meta, f, indent=2)
         print(f"\n=== Full-data retrain (export) ===")
