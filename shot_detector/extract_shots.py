@@ -1,4 +1,5 @@
 import os
+import copy
 import cv2
 import numpy as np
 import pandas as pd
@@ -7,10 +8,15 @@ import torch
 import re
 import argparse
 import json
-from mmpose.apis import MMPoseInferencer
+from shot_detector.track_metrics import (
+    compute_active_track_metrics,
+    compute_idle_track_metrics,
+    save_track_metrics_json,
+)
 from shot_detector.utils import parse_shot_csv, get_video_path, identify_player, get_idle_player
 from shot_detector.utils import load_fisheye_params, load_perspective_matrix, transform_points, get_foot_position
 from shot_detector.ball_features import normalize_ball_features, get_ball_feature_names
+from shot_detector.pose_geometry import joint_angles_rad_from_body12
 
 # Configuration
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,26 +26,26 @@ SHOTS_CSV_DIRS = [
     '/home/ec2-user/data/shot_annotations/',
 ]
 VIDEOS_DIRS = [
+    '/home/ec2-user/data/matches/',
     'videos/',
     '/home/daniele/videos/',
     '/home/ec2-user/data/',
-    '/home/ec2-user/data/matches/',
 ]
 OUTPUT_DIR = 'shot_detector/data/'
 MODEL_CONFIG = 'configs/rtmo-s_8xb32-600e_coco-640x640.py'
 MODEL_CHECKPOINT = 'model_weights/rtmo-s_8xb32-600e_coco-640x640-8db55a59_20231211.pth'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Ball trajectory configuration (defaults to repo root; place CSVs next to pyproject.toml)
-BALL_TRAJECTORY_DIR = _REPO_ROOT
+# Ball trajectory CSVs live in repo ball_trajectories/ (see BALL_TRAJECTORY_MAP filenames).
+BALL_TRAJECTORY_DIR = os.path.join(_REPO_ROOT, 'ball_trajectories')
 FRAME_OFFSET = 0
 MIN_TRAJECTORY_LENGTH = 5
 
-# Map: video name substring -> (trajectory CSV filename, camera_id or None)
-# camera_id=None means the trajectory file already contains only one camera
+# Map: video/annotation substring -> camera_id -> filename under BALL_TRAJECTORY_DIR
+# Filenames match on-disk convention: <session>_<camera>_ball_trajectories.csv (or _ball_trajectory.csv).
 BALL_TRAJECTORY_MAP = {
     '0529b769-125d-4a22-bcee-b1707b87447e': {
-        'BO-0001': 'ball_trajectories_0529b769-125d-4a22-bcee-b1707b87447e_BO-0001.csv',
+        'BO-0001': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0001_ball_trajectories.csv',
         'BO-0002': '0529b769-125d-4a22-bcee-b1707b87447e_BO-0002_ball_trajectories.csv',
     },
     '15-11-2025-15-57_rpi-BO-0001': {
@@ -48,10 +54,22 @@ BALL_TRAJECTORY_MAP = {
     '22-11-2025-18-10_rpi-LU-0002': {
         'LU-0002': '22-11-2025_ball_trajectories.csv',
     },
+    '18dda9d2-baba-4920-a642-d0a9838d01f3': {
+        'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3_rpi_BO-2226_ball_trajectory.csv',
+    },
 }
 
 # Which annotation CSVs to process (None = all available)
 VIDEO_FILTER = None
+
+# Left-handed player on court "right" — mirror COCO pose (flip x + swap L/R) from `from_frame` onward.
+# Match by annotation filename substring. See handedness_mirror_active_idle().
+HANDEDNESS_MIRROR_RULES = (
+    {
+        "csv_substring": "annotation_18dda9d2-baba-4920-a642-d0a9838d01f3_1774557145707_rpi-BO-2226",
+        "from_frame": 129225,
+    },
+)
 
 # Calibration constants
 PARAM_DIR = 'parameters'
@@ -95,18 +113,40 @@ DISTANCE_THRESHOLD = 150 * 150  # 150px squared (pixel space)
 COURT_DISTANCE_THRESHOLD = 2.0 * 2.0  # 2 meters in court space
 
 def init_mmpose():
+    """RTMO via MMPoseInferencer (lazy import so Ultralytics-only runs skip mmpose)."""
+    from mmpose.apis import MMPoseInferencer
+
     if not os.path.exists(MODEL_CONFIG):
         raise FileNotFoundError(f"Config not found: {MODEL_CONFIG}")
     if not os.path.exists(MODEL_CHECKPOINT):
         raise FileNotFoundError(f"Checkpoint not found: {MODEL_CHECKPOINT}")
-    
+
     print(f"Initializing MMPose with {MODEL_CONFIG} on {DEVICE}...")
     print(f"Detection score threshold: 0.05 (lowered from 0.1 in config)")
     return MMPoseInferencer(
         pose2d=MODEL_CONFIG,
         pose2d_weights=MODEL_CHECKPOINT,
-        device=DEVICE
+        device=DEVICE,
     )
+
+
+def init_pose_inferencer(backend="ultralytics"):
+    """
+    Pose backend for extraction and inference.
+
+    Parameters
+    ----------
+    backend : str
+        'mmpose' — RTMO (existing), or 'ultralytics' — YOLOv8m-pose (default weights in ultralytics_pose).
+    """
+    b = (backend or "ultralytics").lower()
+    if b == "mmpose":
+        return init_mmpose()
+    if b == "ultralytics":
+        from shot_detector.ultralytics_pose import init_ultralytics_pose
+
+        return init_ultralytics_pose()
+    raise ValueError(f"Unknown pose backend: {backend!r} (use 'mmpose' or 'ultralytics')")
 
 def match_player_by_position(poses, prev_bbox, prev_court_pos, K, D, H, exclude_idx=-1):
     """Match a player by pixel or court position. Returns (match_idx, new_bbox, new_court_pos)."""
@@ -662,6 +702,82 @@ def unwrap_bbox(bbox):
         return bbox[0]
     return bbox
 
+
+def primary_court_side_from_player_label(player_label):
+    """Return 'left' or 'right' from shot/player label (e.g. lob_left, forehand_right), else None."""
+    s = (player_label or "").lower()
+    has_left = "left" in s
+    has_right = "right" in s
+    if has_left and not has_right:
+        return "left"
+    if has_right and not has_left:
+        return "right"
+    return None
+
+
+def handedness_mirror_active_idle(csv_path, abs_frame, player_label):
+    """
+    For configured matches: from `from_frame` on, the court-right player is left-handed.
+    Mirror active pose when striker is right-court; mirror idle when striker is left-court.
+    Returns (mirror_active, mirror_idle).
+    """
+    path_f = csv_path.replace("\\", "/")
+    base = os.path.basename(path_f)
+    side = primary_court_side_from_player_label(player_label)
+    for rule in HANDEDNESS_MIRROR_RULES:
+        sub = rule["csv_substring"]
+        if sub not in path_f and sub not in base:
+            continue
+        if abs_frame < int(rule["from_frame"]):
+            return False, False
+        if side == "right":
+            return True, False
+        if side == "left":
+            return False, True
+        return False, False
+    return False, False
+
+
+def mirror_coco_pose_horizontal(pose, img_width):
+    """Horizontal flip in image space + swap COCO L/R pairs. Returns deep-copied pose dict."""
+    if pose is None or "keypoints" not in pose:
+        return pose
+    out = copy.deepcopy(pose)
+    w = float(img_width)
+    kpts = out["keypoints"]
+    if not kpts or len(kpts) < 17:
+        return out
+    rows = []
+    for i in range(17):
+        kp = kpts[i]
+        x = float(kp[0])
+        y = float(kp[1]) if len(kp) > 1 else 0.0
+        sc = float(kp[2]) if len(kp) > 2 else 1.0
+        rows.append([w - 1.0 - x, y, sc])
+    pairs = ((1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16))
+    for a, b in pairs:
+        rows[a], rows[b] = rows[b], rows[a]
+    new_kpts = []
+    for i in range(17):
+        orig = kpts[i]
+        if len(orig) > 2:
+            new_kpts.append([rows[i][0], rows[i][1], rows[i][2]])
+        else:
+            new_kpts.append([rows[i][0], rows[i][1]])
+    out["keypoints"] = new_kpts
+    if "keypoint_scores" in out and out["keypoint_scores"] is not None and len(out["keypoint_scores"]) >= 17:
+        ks = list(out["keypoint_scores"])
+        for a, b in pairs:
+            ks[a], ks[b] = ks[b], ks[a]
+        out["keypoint_scores"] = ks
+    bb = unwrap_bbox(out["bbox"])
+    if len(bb) >= 4:
+        x1, y1, x2, y2 = bb[:4]
+        nx1, nx2 = w - float(x2), w - float(x1)
+        out["bbox"] = [[nx1, float(y1), nx2, float(y2)]]
+    return out
+
+
 def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info=None, 
                 is_forward_filled=False, forward_filled_pose=None, filtering_info=None,
                 ball_positions=None, frame_idx_in_clip=None, start_frame=0):
@@ -674,7 +790,7 @@ def draw_overlay(frame, poses, active_idx, idle_idx, debug=False, all_poses_info
         is_forward_filled: If True, active player is forward-filled (show in blue)
         forward_filled_pose: The pose to draw when forward-filling (if None, uses last pose in poses)
         filtering_info: Dict with 'filtered_per_frame' and 'flickering_per_frame' sets of pose indices
-        ball_positions: Dict {frame_number: (x, y, confidence, is_interpolated)} for ball positions
+        ball_positions: Dict frame_number -> (x, y, confidence, is_interpolated); draw uses [0],[1] only
         frame_idx_in_clip: Current frame index in clip (0-based)
         start_frame: Starting frame number in video
     """
@@ -1090,8 +1206,10 @@ def find_closest_trajectory_to_player(trajectories, player_poses_per_frame, star
 def normalize_keypoints_body_relative(keypoints, image_width, image_height):
     """
     Normalize keypoints using body-relative normalization.
-    Returns 27 features: 24 body-relative + 3 absolute position features.
-    
+    Returns 31 features: 24 body-relative + feet (x,y) and shoulder-center y in
+    image-normalized coords + 4 upper-limb joint angles (radians).
+    Feet: both ankles -> mean; one ankle -> that ankle; none -> NaN (no hip fallback).
+
     keypoints: Array of shape (12, 2) containing x, y coordinates for the 12 body parts
     """
     # Extract body keypoints (12 keypoints)
@@ -1128,31 +1246,52 @@ def normalize_keypoints_body_relative(keypoints, image_width, image_height):
         shoulder_center = np.array([0.0, 0.0])
     else:
         shoulder_center = (left_shoulder + right_shoulder) / 2.0
-    
-    # Normalize absolute positions by image size
-    hip_y_abs = hip_center[1] / image_height if not np.isnan(hip_center[1]) else 0.0
-    hip_x_abs = hip_center[0] / image_width if not np.isnan(hip_center[0]) else 0.0
+
+    left_ankle = body_keypoints[10]
+    right_ankle = body_keypoints[11]
+    la_ok = not (np.any(np.isnan(left_ankle)))
+    ra_ok = not (np.any(np.isnan(right_ankle)))
+    if la_ok and ra_ok:
+        feet_center = (left_ankle + right_ankle) / 2.0
+    elif la_ok:
+        feet_center = left_ankle.astype(np.float64, copy=True)
+    elif ra_ok:
+        feet_center = right_ankle.astype(np.float64, copy=True)
+    else:
+        feet_center = np.array([np.nan, np.nan], dtype=np.float64)
+
+    feet_mid_y_abs = (
+        float(feet_center[1] / image_height) if np.isfinite(feet_center[1]) else float("nan")
+    )
+    feet_mid_x_abs = (
+        float(feet_center[0] / image_width) if np.isfinite(feet_center[0]) else float("nan")
+    )
     shoulder_center_y_abs = shoulder_center[1] / image_height if not np.isnan(shoulder_center[1]) else 0.0
-    
-    # Combine: 24 body-relative features + 3 absolute features = 27 features
-    features = np.concatenate([
-        body_relative_flat,  # (24,)
-        np.array([hip_y_abs, hip_x_abs, shoulder_center_y_abs])  # (3,)
-    ])
-    
+
+    angles = joint_angles_rad_from_body12(body_keypoints)
+
+    # 24 body-relative + 3 image-normalized positions + 4 angles
+    features = np.concatenate(
+        [
+            body_relative_flat,
+            np.array([feet_mid_y_abs, feet_mid_x_abs, shoulder_center_y_abs], dtype=np.float64),
+            angles,
+        ]
+    )
+
     return features
 
 def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=None, 
                  ball_positions=None, start_frame=0):
     """
     Saves the pose sequence to a CSV with normalized features.
-    Format: frame_num, left_shoulder_x_body_rel, left_shoulder_y_body_rel, ..., hip_y_abs, hip_x_abs, shoulder_center_y_abs,
-            ball_x_body_rel, ball_y_body_rel, ball_x_abs, ball_y_abs, ball_vx_body_rel, ball_vy_body_rel, ball_visible, ball_confidence
+    Format: frame_num, 24 body-rel joints, feet_mid_y_abs, feet_mid_x_abs, shoulder_center_y_abs,
+            four upper-limb angles (rad), then ball_* columns.
     
     If image_width/height are not provided, falls back to raw keypoint format.
     
     Args:
-        ball_positions: Dict {frame_number: (x, y, confidence, is_interpolated)} for ball positions
+        ball_positions: Dict frame_number -> (x, y, confidence, is_interpolated); draw uses [0],[1] only
         start_frame: Starting frame number in video (for matching ball positions)
     """
     data = []
@@ -1214,9 +1353,13 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                     for i, kp_name in enumerate(BODY_KEYPOINT_NAMES):
                         row[f'{kp_name}_x_body_rel'] = features[i * 2]
                         row[f'{kp_name}_y_body_rel'] = features[i * 2 + 1]
-                    row['hip_y_abs'] = features[24]
-                    row['hip_x_abs'] = features[25]
-                    row['shoulder_center_y_abs'] = features[26]
+                    row["feet_mid_y_abs"] = features[24]
+                    row["feet_mid_x_abs"] = features[25]
+                    row["shoulder_center_y_abs"] = features[26]
+                    row["left_elbow_angle_rad"] = features[27]
+                    row["right_elbow_angle_rad"] = features[28]
+                    row["left_shoulder_angle_rad"] = features[29]
+                    row["right_shoulder_angle_rad"] = features[30]
                     
                     # Extract ball features if available
                     if ball_positions is not None:
@@ -1250,16 +1393,23 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                         ball_prev_pos = None
                         ball_prev_prev_pos = None
                         if prev_ball_data:
-                            ball_prev_pos = np.array([prev_ball_data[0], prev_ball_data[1]])
+                            ball_prev_pos = np.array(
+                                [prev_ball_data[0], prev_ball_data[1]], dtype=np.float64
+                            )
                         if prev_prev_ball_data:
-                            ball_prev_prev_pos = np.array([prev_prev_ball_data[0], prev_prev_ball_data[1]])
-                        
-                        # Extract ball features
-                        # ball_positions stores only (x, y) — same as extract_clips_with_ball.py
+                            ball_prev_prev_pos = np.array(
+                                [prev_prev_ball_data[0], prev_prev_ball_data[1]], dtype=np.float64
+                            )
+
+                        # ball_data: (x, y, confidence, is_interpolated) from trajectory CSV; legacy (x,y) ok
                         if ball_data:
-                            ball_pos = np.array([ball_data[0], ball_data[1]])
-                            ball_confidence = 1.0
-                            ball_visible = True
+                            ball_pos = np.array([ball_data[0], ball_data[1]], dtype=np.float64)
+                            if len(ball_data) >= 4:
+                                ball_confidence = float(ball_data[2])
+                                ball_visible = not bool(ball_data[3])
+                            else:
+                                ball_confidence = 1.0
+                                ball_visible = True
                         else:
                             ball_pos = None
                             ball_confidence = 0.0
@@ -1286,9 +1436,13 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                     for kp_name in BODY_KEYPOINT_NAMES:
                         row[f'{kp_name}_x_body_rel'] = np.nan
                         row[f'{kp_name}_y_body_rel'] = np.nan
-                    row['hip_y_abs'] = np.nan
-                    row['hip_x_abs'] = np.nan
-                    row['shoulder_center_y_abs'] = np.nan
+                    row["feet_mid_y_abs"] = np.nan
+                    row["feet_mid_x_abs"] = np.nan
+                    row["shoulder_center_y_abs"] = np.nan
+                    row["left_elbow_angle_rad"] = np.nan
+                    row["right_elbow_angle_rad"] = np.nan
+                    row["left_shoulder_angle_rad"] = np.nan
+                    row["right_shoulder_angle_rad"] = np.nan
                     # Ball features also NaN
                     ball_feature_names = get_ball_feature_names()
                     for feat_name in ball_feature_names:
@@ -1298,9 +1452,13 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
                 for kp_name in BODY_KEYPOINT_NAMES:
                     row[f'{kp_name}_x_body_rel'] = np.nan
                     row[f'{kp_name}_y_body_rel'] = np.nan
-                row['hip_y_abs'] = np.nan
-                row['hip_x_abs'] = np.nan
-                row['shoulder_center_y_abs'] = np.nan
+                row["feet_mid_y_abs"] = np.nan
+                row["feet_mid_x_abs"] = np.nan
+                row["shoulder_center_y_abs"] = np.nan
+                row["left_elbow_angle_rad"] = np.nan
+                row["right_elbow_angle_rad"] = np.nan
+                row["left_shoulder_angle_rad"] = np.nan
+                row["right_shoulder_angle_rad"] = np.nan
                 # Ball features also NaN
                 ball_feature_names = get_ball_feature_names()
                 for feat_name in ball_feature_names:
@@ -1314,7 +1472,17 @@ def save_pose_csv(poses_sequence, output_path, image_width=None, image_height=No
         column_order = ['frame_num']
         for kp_name in BODY_KEYPOINT_NAMES:
             column_order.extend([f'{kp_name}_x_body_rel', f'{kp_name}_y_body_rel'])
-        column_order.extend(['hip_y_abs', 'hip_x_abs', 'shoulder_center_y_abs'])
+        column_order.extend(
+            [
+                "feet_mid_y_abs",
+                "feet_mid_x_abs",
+                "shoulder_center_y_abs",
+                "left_elbow_angle_rad",
+                "right_elbow_angle_rad",
+                "left_shoulder_angle_rad",
+                "right_shoulder_angle_rad",
+            ]
+        )
         # Add ball features
         ball_feature_names = get_ball_feature_names()
         column_order.extend(ball_feature_names)
@@ -1381,10 +1549,35 @@ def main():
         help='Process only the first N annotation CSVs after filters (smoke test / partial run)',
     )
     parser.add_argument(
+        '--random-csv-files',
+        type=int,
+        default=None,
+        help='After trajectory filter, shuffle and keep N annotation CSVs (use with --random-seed)',
+    )
+    parser.add_argument(
+        '--random-seed',
+        type=int,
+        default=42,
+        help='RNG seed for --random-csv-files (default: 42)',
+    )
+    parser.add_argument(
         '--max-shots',
         type=int,
         default=None,
         help='Stop after this many shots have been fully exported (clips + CSV)',
+    )
+    parser.add_argument(
+        '--pose-backend',
+        type=str,
+        choices=['mmpose', 'ultralytics'],
+        default='ultralytics',
+        help="Pose model: 'mmpose' (RTMO) or 'ultralytics' (YOLOv8m-pose, default)",
+    )
+    parser.add_argument(
+        '--video-tail-extra-frames',
+        type=int,
+        default=0,
+        help='Append N raw frames to the MP4 clip AFTER the pose window ends. CSV stays at 30 frames. Use 45 for +1.5s @ 30fps.',
     )
     args = parser.parse_args()
 
@@ -1401,8 +1594,7 @@ def main():
     # Ensure output directories exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Initialize MMPose
-    inferencer = init_mmpose()
+    inferencer = init_pose_inferencer(args.pose_backend)
     
     # List CSVs from all directories
     csv_files_map = {} # filename -> full_path
@@ -1432,7 +1624,18 @@ def main():
         print(f"No CSV files found matching trajectory map keys: {list(BALL_TRAJECTORY_MAP.keys())}")
         return
 
-    if args.max_csv_files is not None and args.max_csv_files > 0:
+    if args.random_csv_files is not None and args.random_csv_files > 0:
+        import random
+
+        rng = random.Random(args.random_seed)
+        pool = list(csv_files)
+        rng.shuffle(pool)
+        n = min(args.random_csv_files, len(pool))
+        csv_files = pool[:n]
+        print(
+            f"Random subset: {len(csv_files)} CSV file(s) (--random-csv-files {args.random_csv_files}, seed={args.random_seed})"
+        )
+    elif args.max_csv_files is not None and args.max_csv_files > 0:
         csv_files = csv_files[: args.max_csv_files]
         print(f"Limited to first {len(csv_files)} CSV file(s) (--max-csv-files)")
     
@@ -1718,8 +1921,14 @@ def main():
                         # So video_frame = traj_frame - FRAME_OFFSET (subtracting negative adds)
                         video_frame_num = traj_frame_num - FRAME_OFFSET
                         if start_frame <= video_frame_num < start_frame + duration:
-                            # Store ONLY (x, y) — same as extract_clips_with_ball.py
-                            ball_positions[video_frame_num] = (row['position_x'], row['position_y'])
+                            conf = float(row["confidence"]) if "confidence" in row.index else 1.0
+                            interp = bool(row["is_interpolated"]) if "is_interpolated" in row.index else False
+                            ball_positions[video_frame_num] = (
+                                float(row["position_x"]),
+                                float(row["position_y"]),
+                                conf,
+                                interp,
+                            )
                     
                     # Always print if we have ball data
                     tqdm.write(f"    ✅ Matched ball trajectory {best_traj_id}: {len(ball_positions)} frames with ball data (clip: {start_frame} to {start_frame+duration})")
@@ -1749,6 +1958,29 @@ def main():
             else:
                 tqdm.write(f"    ⚠️  No trajectories available for this video")
 
+            # Active-ID stability on raw tracks (before handedness mirroring)
+            h, w = frames[0].shape[:2]
+            track_quality = compute_active_track_metrics(
+                tracked_active_indices,
+                poses_per_frame,
+                start_frame,
+                float(w),
+                get_foot_position,
+                unwrap_bbox,
+                jump_pixel_threshold=150.0,
+            )
+            track_quality.update(
+                compute_idle_track_metrics(
+                    tracked_idle_indices,
+                    poses_per_frame,
+                    start_frame,
+                    float(w),
+                    get_foot_position,
+                    unwrap_bbox,
+                    jump_pixel_threshold=150.0,
+                )
+            )
+
             # Generate output with forward-fill for missing frames (max 5 consecutive)
             pose_data_sequence = []  # Active player
             idle_pose_data_sequence = []  # Idle player
@@ -1757,31 +1989,45 @@ def main():
             consecutive_lost_frames = 0
             consecutive_lost_idle_frames = 0
             MAX_FORWARD_FILL = 5
-            
+            mirrored_active_frames = 0
+            mirrored_idle_frames = 0
+
             # Create output video (optional)
             if (not args.no_video) and frames:
-                h, w = frames[0].shape[:2]
                 clip_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}.mp4"
                 clip_path = os.path.join(output_dir, clip_filename)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(clip_path, fourcc, 30.0, (w, h))
             else:
                 out = None
-            
+
             for i in range(len(frames)):
                 frame = frames[i]
                 poses = poses_per_frame[i]
-                
+
                 act_idx = tracked_active_indices.get(i, -1)
                 idl_idx = tracked_idle_indices.get(i, -1)
-                
+
+                abs_f = start_frame + i
+                ma, mi = handedness_mirror_active_idle(csv_path, abs_f, player_label)
+
                 # Check if we're forward-filling
                 is_forward_filled = False
                 forward_filled_pose = None
                 if act_idx == -1 and last_valid_pose is not None and consecutive_lost_frames < MAX_FORWARD_FILL:
                     is_forward_filled = True
                     forward_filled_pose = last_valid_pose
-                
+
+                # Overlay: optional horizontal mirror for handedness (same as CSV export)
+                poses_draw = list(poses)
+                if act_idx >= 0 and act_idx < len(poses_draw) and ma:
+                    poses_draw[act_idx] = mirror_coco_pose_horizontal(poses_draw[act_idx], w)
+                if idl_idx >= 0 and idl_idx < len(poses_draw) and mi:
+                    poses_draw[idl_idx] = mirror_coco_pose_horizontal(poses_draw[idl_idx], w)
+                forward_filled_draw = forward_filled_pose
+                if is_forward_filled and forward_filled_draw is not None and ma:
+                    forward_filled_draw = mirror_coco_pose_horizontal(forward_filled_draw, w)
+
                 # Overlay - pass all poses info if available
                 all_poses_info = all_poses_per_frame[i] if (all_poses_per_frame and i < len(all_poses_per_frame)) else None
                 # Get filtering info for this frame
@@ -1798,45 +2044,87 @@ def main():
                         tqdm.write(f"      ✓ Passing ball_positions to draw_overlay: {len(ball_positions)} entries, first frame {start_frame}")
                     else:
                         tqdm.write(f"      ⚠️  WARNING - ball_positions is empty or None when calling draw_overlay!")
-                
-                vis_frame = draw_overlay(frame, poses, act_idx, idl_idx, debug=DEBUG_MODE, 
-                                        all_poses_info=all_poses_info, is_forward_filled=is_forward_filled,
-                                        forward_filled_pose=forward_filled_pose, filtering_info=frame_filtering_info,
-                                        ball_positions=ball_positions, frame_idx_in_clip=i, start_frame=start_frame)
+
+                vis_frame = draw_overlay(
+                    frame,
+                    poses_draw,
+                    act_idx,
+                    idl_idx,
+                    debug=DEBUG_MODE,
+                    all_poses_info=all_poses_info,
+                    is_forward_filled=is_forward_filled,
+                    forward_filled_pose=forward_filled_draw,
+                    filtering_info=frame_filtering_info,
+                    ball_positions=ball_positions,
+                    frame_idx_in_clip=i,
+                    start_frame=start_frame,
+                )
                 if out is not None:
                     out.write(vis_frame)
-                
-                # Collect active pose data with forward-fill (max 5 consecutive frames)
+
+                # Collect active pose (handedness mirror applied per output frame; keep raw in last_valid_pose)
                 if act_idx != -1 and act_idx < len(poses):
-                    last_valid_pose = poses[act_idx]
-                    pose_data_sequence.append(poses[act_idx])
-                    consecutive_lost_frames = 0  # Reset counter
+                    raw = poses[act_idx]
+                    last_valid_pose = raw
+                    out_pose = mirror_coco_pose_horizontal(copy.deepcopy(raw), w) if ma else raw
+                    if ma:
+                        mirrored_active_frames += 1
+                    pose_data_sequence.append(out_pose)
+                    consecutive_lost_frames = 0
                 else:
-                    # Use previous frame's pose if available and within limit
                     if last_valid_pose is not None and consecutive_lost_frames < MAX_FORWARD_FILL:
-                        pose_data_sequence.append(last_valid_pose)
+                        out_pose = (
+                            mirror_coco_pose_horizontal(copy.deepcopy(last_valid_pose), w)
+                            if ma
+                            else copy.deepcopy(last_valid_pose)
+                        )
+                        if ma:
+                            mirrored_active_frames += 1
+                        pose_data_sequence.append(out_pose)
                         consecutive_lost_frames += 1
                     else:
-                        pose_data_sequence.append(None)  # Lost for too long or never had valid pose
+                        pose_data_sequence.append(None)
                         consecutive_lost_frames += 1
-                
-                # Collect idle pose data with forward-fill (max 5 consecutive frames)
+
+                # Collect idle pose data with forward-fill
                 if idl_idx != -1 and idl_idx < len(poses):
-                    last_valid_idle_pose = poses[idl_idx]
-                    idle_pose_data_sequence.append(poses[idl_idx])
-                    consecutive_lost_idle_frames = 0  # Reset counter
+                    raw_i = poses[idl_idx]
+                    last_valid_idle_pose = raw_i
+                    out_i = mirror_coco_pose_horizontal(copy.deepcopy(raw_i), w) if mi else raw_i
+                    if mi:
+                        mirrored_idle_frames += 1
+                    idle_pose_data_sequence.append(out_i)
+                    consecutive_lost_idle_frames = 0
                 else:
-                    # Use previous frame's pose if available and within limit
                     if last_valid_idle_pose is not None and consecutive_lost_idle_frames < MAX_FORWARD_FILL:
-                        idle_pose_data_sequence.append(last_valid_idle_pose)
+                        out_i = (
+                            mirror_coco_pose_horizontal(copy.deepcopy(last_valid_idle_pose), w)
+                            if mi
+                            else copy.deepcopy(last_valid_idle_pose)
+                        )
+                        if mi:
+                            mirrored_idle_frames += 1
+                        idle_pose_data_sequence.append(out_i)
                         consecutive_lost_idle_frames += 1
                     else:
-                        idle_pose_data_sequence.append(None)  # Lost for too long or never had valid pose
+                        idle_pose_data_sequence.append(None)
                         consecutive_lost_idle_frames += 1
-            
+
             if out is not None:
+                tail_n = max(0, int(args.video_tail_extra_frames))
+                if tail_n > 0:
+                    tail_start = start_frame + len(frames)
+                    tail_cap = cv2.VideoCapture(video_path)
+                    if tail_cap.isOpened():
+                        tail_cap.set(cv2.CAP_PROP_POS_FRAMES, tail_start)
+                        for _ in range(tail_n):
+                            ok, tf = tail_cap.read()
+                            if not ok:
+                                break
+                            out.write(tf)
+                        tail_cap.release()
                 out.release()
-            
+
             # Save CSV with normalized features
             # Get image dimensions from first frame (or from video if available)
             if frames and len(frames) > 0:
@@ -1869,6 +2157,18 @@ def main():
                              image_width=img_width, image_height=img_height,
                              ball_positions=ball_positions if ball_positions else None,
                              start_frame=start_frame)
+
+            track_quality['csv_file'] = csv_file
+            track_quality['video_name'] = video_name
+            track_quality['center_frame'] = int(center_frame)
+            track_quality['shot_type'] = shot_type
+            track_quality['player_label'] = player_label
+            track_quality['handedness'] = {
+                'mirrored_active_frames': mirrored_active_frames,
+                'mirrored_idle_frames': mirrored_idle_frames,
+            }
+            metrics_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}_track_metrics.json"
+            save_track_metrics_json(track_quality, os.path.join(output_dir, metrics_filename))
 
             # Mark shot as completed and persist immediately for crash-safe resume.
             processed_shots.add(shot_key)

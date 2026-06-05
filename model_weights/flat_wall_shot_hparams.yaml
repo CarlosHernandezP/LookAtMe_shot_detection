@@ -1,0 +1,17 @@
+auto_select_features: false
+cv_folds: 0
+data_dir: 'shot_detector/data_csv_only'
+export_counts: false
+feature_select_cv_folds: 3
+feature_select_grid: '80,120,160,200,240,280,320,360,400,440,480,533'
+idle_min_prob: 0.3213826738297939
+include_lists_dir: null
+min_samples: 5
+non_idle_weight_mult: 1.9181711940728994
+output_dir: 'autoresearch/runs/2026-05-14/shot-classifier-features/winner/trained'
+save_model: true
+select_top_k_features: 160
+selection_train_fraction: 0.8
+serve_weight_mult: 1.406412766687572
+val_fraction: 0.2
+weight_scheme: 'max_inverse'
