@@ -208,6 +208,8 @@ def main():
     ap.add_argument("--channels", type=int, default=96, help="TCN channels")
     ap.add_argument("--kernel-size", type=int, default=3, help="TCN kernel size")
     ap.add_argument("--dropout", type=float, default=0.2, help="TCN dropout")
+    ap.add_argument("--save-model", action="store_true",
+                    help="After CV: refit on ALL data (with an internal early-stop split) and export weights + z-norm stats + meta")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -286,6 +288,42 @@ def main():
     print(f"  accuracy: {np.mean(accs):.4f}")
     print(f"  OOF f1_macro: {oof['f1_macro']:.4f}")
     print(f"Saved {path}")
+
+    if args.save_model:
+        from sklearn.model_selection import train_test_split
+
+        # z-norm on ALL data for the exported model
+        mu = X.reshape(-1, X.shape[2]).mean(axis=0)
+        sd = X.reshape(-1, X.shape[2]).std(axis=0) + 1e-6
+        Xn = (X - mu) / sd
+        # internal stratified split only for early stopping
+        tr, va = train_test_split(np.arange(len(y)), test_size=0.1, stratify=y, random_state=42)
+        sw = compute_sample_weights(
+            y[tr], le.classes_, args.serve_weight_mult, args.non_idle_weight_mult,
+            weight_scheme=args.weight_scheme,
+        )
+        model, _, best_f1 = train_one_fold(
+            Xn[tr], y[tr], sw, Xn[va], y[va], args.arch, n_classes,
+            args.epochs, args.batch_size, args.lr, args.patience, seed=4242,
+            augment=args.augment, label_smoothing=args.label_smoothing,
+            channels=args.channels, kernel_size=args.kernel_size, dropout=args.dropout,
+        )
+        bundle = {
+            "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+            "arch": args.arch,
+            "arch_kwargs": {"channels": args.channels, "kernel_size": args.kernel_size,
+                            "dropout": args.dropout} if args.arch == "tcn" else {},
+            "n_features": int(X.shape[2]),
+            "seq_len": int(X.shape[1]),
+            "classes": class_names,
+            "norm_mean": mu.tolist(),
+            "norm_std": sd.tolist(),
+            "early_stop_val_f1": float(best_f1),
+            "cv_report": str(path.name),
+        }
+        mpath = out_dir / f"seq_{args.arch}_model.pt"
+        torch.save(bundle, mpath)
+        print(f"Saved model bundle: {mpath} (internal-split val f1={best_f1:.4f})")
 
 
 if __name__ == "__main__":
