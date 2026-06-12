@@ -1,0 +1,54 @@
+{
+  "_doc": "One entry per match-id. Update via shot_detector/tools/scan_match_registry.py (auto fields) + by hand (training fields). Skill: ~/.claude/skills/retraining-shot-classifier",
+  "matches": {
+    "0529b769-125d-4a22-bcee-b1707b87447e": {
+      "annotation_csvs": [
+        "annotation_0529b769-125d-4a22-bcee-b1707b87447e_1767949074880_rpi-BO-0002_period2.csv",
+        "annotation_0529b769-125d-4a22-bcee-b1707b87447e_1767949074894_rpi-BO-0001_period1.csv",
+        "annotation_0529b769-125d-4a22-bcee-b1707b87447e_1767949074894_rpi-BO-0001_period3.csv"
+      ],
+      "cameras": ["BO-0001", "BO-0002"],
+      "intermediate_root": "/home/ec2-user/carlos/LookAtMeProtoApp/data/intermediate",
+      "videos_present": true,
+      "extracted_datasets": ["data_csv_only", "extract_all_with_clips_v2", "extract_all_with_clips_v2_reid"],
+      "in_deployed_model": true
+    },
+    "15-11-2025-15-57_rpi-BO-0001": {
+      "annotation_csvs": ["annotation_15-11-2025-15-57_rpi-BO-0001_1.csv"],
+      "cameras": ["BO-0001"],
+      "intermediate_root": "/home/ec2-user/carlos/LookAtMeProtoApp/data/intermediate",
+      "videos_present": true,
+      "extracted_datasets": ["data_csv_only", "extract_all_with_clips_v2", "extract_all_with_clips_v2_reid"],
+      "in_deployed_model": true
+    },
+    "18dda9d2-baba-4920-a642-d0a9838d01f3": {
+      "annotation_csvs": ["annotation_18dda9d2-baba-4920-a642-d0a9838d01f3_1774557145707_rpi-BO-2226.csv"],
+      "cameras": ["BO-2226"],
+      "intermediate_root": "/home/ec2-user/carlos/LookAtMeProtoApp/data/intermediate",
+      "videos_present": true,
+      "extracted_datasets": ["extract_all_with_clips_v2", "extract_all_with_clips_v2_reid"],
+      "in_deployed_model": false,
+      "notes": "Handedness mirror rule from frame 129225 (HANDEDNESS_MIRROR_RULES in extract_shots.py). BO-2227 camera also processed upstream but unannotated."
+    },
+    "22-11-2025-18-10_rpi-LU-0002": {
+      "annotation_csvs": [
+        "annotation_22-11-2025-18-10_rpi-LU-0002_1.csv",
+        "annotation_22-11-2025-18-10_rpi-LU-0002_2.csv"
+      ],
+      "cameras": ["LU-0002"],
+      "intermediate_root": "/home/ec2-user/carlos/LookAtMeProtoApp/data/intermediate",
+      "videos_present": true,
+      "extracted_datasets": ["data_csv_only", "extract_all_with_clips_v2", "extract_all_with_clips_v2_reid"],
+      "in_deployed_model": true
+    },
+    "a145dd19-9060-4e8a-bf63-8dfec40f78dd": {
+      "annotation_csvs": ["annotation_a145dd19-9060-4e8a-bf63-8dfec40f78dd_1778235825_rpi-BO-2222.csv"],
+      "cameras": ["BO-2222"],
+      "intermediate_root": null,
+      "videos_present": false,
+      "extracted_datasets": [],
+      "in_deployed_model": false,
+      "notes": "NEW 2026-06. Annotation has extra 'Good' column (annotator success/fail label - useful for success-prediction dataset). Video + upstream pipeline artifacts missing; needs gdrive ID from Carlos, then ProtoApp batch inference."
+    }
+  }
+}
