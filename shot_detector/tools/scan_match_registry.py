@@ -35,7 +35,10 @@ DATASET_DIRS = [
     REPO_ROOT / "shot_detector" / "data_csv_only",
     REPO_ROOT / "shot_detector" / "data" / "extract_all_with_clips_v2",
     REPO_ROOT / "shot_detector" / "data" / "extract_all_with_clips_v2_reid",
+    REPO_ROOT / "shot_detector" / "data" / "extract_intermediate_poses",
 ]
+# Canonical training dataset (sequential-read intermediate poses, VFR-safe)
+CANONICAL_DATASET = "extract_intermediate_poses"
 REGISTRY_PATH = REPO_ROOT / "shot_detector" / "pipeline_state" / "match_registry.json"
 EXTRACT_SHOTS = REPO_ROOT / "shot_detector" / "extract_shots.py"
 
@@ -102,14 +105,14 @@ def scan() -> dict:
 
 def print_report(scanned: dict, registry: dict) -> None:
     deployed = {m for m, r in registry.get("matches", {}).items() if r.get("in_deployed_model")}
-    cols = ["match_id", "ann", "video", "intermediate", "reid_extract", "ball_map", "reid_map", "deployed"]
+    cols = ["match_id", "ann", "video", "intermediate", "canonical_ds", "ball_map", "reid_map", "deployed"]
     print(f"{cols[0]:<42} {cols[1]:>3} {cols[2]:>5} {cols[3]:>12} {cols[4]:>12} {cols[5]:>8} {cols[6]:>8} {cols[7]:>8}")
     for mid, r in sorted(scanned.items()):
         print(
             f"{mid:<42} {len(r['annotation_csvs']):>3} "
             f"{'yes' if r['videos'] else 'NO':>5} "
             f"{(Path(r['intermediate_root']).parts[-3] if r['intermediate_root'] else 'NO'):>12} "
-            f"{'yes' if 'extract_all_with_clips_v2_reid' in r['extracted_datasets'] else 'NO':>12} "
+            f"{'yes' if CANONICAL_DATASET in r['extracted_datasets'] else 'NO':>12} "
             f"{'yes' if r['registered_ball_map'] else 'NO':>8} "
             f"{'yes' if r['registered_reid_map'] else 'NO':>8} "
             f"{'yes' if mid in deployed else 'no':>8}"

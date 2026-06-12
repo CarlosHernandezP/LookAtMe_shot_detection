@@ -116,6 +116,8 @@ def main():
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--min-active-coverage", type=int, default=15,
                     help="Skip shot if active player has pose rows in fewer than N of 30 frames (pre forward-fill)")
+    ap.add_argument("--only", type=str, default=None,
+                    help="Process only annotation CSVs whose filename contains this substring")
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -128,6 +130,8 @@ def main():
 
     totals = Counter()
     for csv_file in sorted(csv_files):
+        if args.only and args.only not in csv_file:
+            continue
         csv_path = csv_files[csv_file]
         match_key, cam = resolve_match_cam(csv_path)
         if not match_key:

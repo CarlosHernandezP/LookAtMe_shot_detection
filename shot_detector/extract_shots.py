@@ -59,6 +59,9 @@ BALL_TRAJECTORY_MAP = {
     '18dda9d2-baba-4920-a642-d0a9838d01f3': {
         'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3_rpi_BO-2226_ball_trajectory.csv',
     },
+    'a145dd19-9060-4e8a-bf63-8dfec40f78dd': {
+        'BO-2222': 'a145dd19-9060-4e8a-bf63-8dfec40f78dd_BO-2222_ball_trajectories.csv',
+    },
 }
 
 # players_reid.csv lives in the LookAtMeProtoApp pipeline output tree.
@@ -77,6 +80,11 @@ PLAYERS_REID_MAP = {
     },
     '18dda9d2-baba-4920-a642-d0a9838d01f3': {
         'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3/BO-2226/players_reid.csv',
+    },
+    # Absolute path: this match lives in the stats-poc tree, not LookAtMeProtoApp
+    # (os.path.join ignores PLAYERS_REID_ROOT when the value is absolute).
+    'a145dd19-9060-4e8a-bf63-8dfec40f78dd': {
+        'BO-2222': '/home/ec2-user/carlos/stats-poc/data/intermediate/a145dd19-9060-4e8a-bf63-8dfec40f78dd/BO-2222/players_reid.csv',
     },
 }
 

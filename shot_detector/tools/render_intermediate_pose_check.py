@@ -69,6 +69,10 @@ def main():
     ap.add_argument("--per-class", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fps", type=float, default=15.0)
+    ap.add_argument("--only", type=str, default=None,
+                    help="Only annotation CSVs whose filename contains this substring")
+    ap.add_argument("--max-clips", type=int, default=None,
+                    help="Cap total clips (spread across classes)")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     rng = random.Random(args.seed)
@@ -82,6 +86,8 @@ def main():
                 if f.endswith(".csv"):
                     csv_files[f] = os.path.join(d, f)
     for csv_file, csv_path in sorted(csv_files.items()):
+        if args.only and args.only not in csv_file:
+            continue
         mk, cam = resolve_match_cam(csv_path)
         if not mk:
             continue
@@ -95,6 +101,24 @@ def main():
     for cls, items in sorted(by_class.items()):
         rng.shuffle(items)
         picks.extend((cls, *it) for it in items[: args.per_class])
+    if args.max_clips is not None and len(picks) > args.max_clips:
+        # round-robin across classes so the cap keeps class variety
+        by_cls = defaultdict(list)
+        for p in picks:
+            by_cls[p[0]].append(p)
+        capped, i = [], 0
+        while len(capped) < args.max_clips:
+            added = False
+            for cls in sorted(by_cls):
+                if i < len(by_cls[cls]):
+                    capped.append(by_cls[cls][i])
+                    added = True
+                    if len(capped) >= args.max_clips:
+                        break
+            if not added:
+                break
+            i += 1
+        picks = capped
     print(f"{len(by_class)} classes, {len(picks)} clips to render")
 
     # Group picks per (match, cam) to load artifacts once
