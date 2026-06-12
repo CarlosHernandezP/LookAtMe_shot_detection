@@ -98,16 +98,53 @@ def make_model(arch: str, n_features: int, n_classes: int) -> nn.Module:
     raise ValueError(arch)
 
 
+def augment_batch(xb: torch.Tensor, noise_std: float = 0.02,
+                  resample_range: float = 0.1, frame_dropout: float = 0.05) -> torch.Tensor:
+    """
+    On-the-fly augmentation on z-normed sequences (B, T, F):
+    - random temporal resampling (speed 1±resample_range, linear interp back to T)
+    - gaussian keypoint noise
+    - random frame dropout (frame copied from previous frame)
+    """
+    B, T, F = xb.shape
+    dev = xb.device
+    # speed perturbation per sample
+    rates = 1.0 + (torch.rand(B, device=dev) * 2 - 1) * resample_range
+    base = torch.arange(T, device=dev, dtype=torch.float32)
+    out = torch.empty_like(xb)
+    for b in range(B):
+        src = torch.clamp(base * rates[b], 0, T - 1)
+        lo = src.floor().long()
+        hi = torch.clamp(lo + 1, max=T - 1)
+        frac = (src - lo.float()).unsqueeze(1)
+        out[b] = xb[b, lo] * (1 - frac) + xb[b, hi] * frac
+    # frame dropout: replace frame t with t-1
+    drop = torch.rand(B, T, device=dev) < frame_dropout
+    drop[:, 0] = False
+    idx = torch.arange(T, device=dev).expand(B, T).clone()
+    idx[drop] = idx[drop] - 1
+    out = out.gather(1, idx.unsqueeze(2).expand(B, T, F))
+    # additive noise
+    out = out + torch.randn_like(out) * noise_std
+    return out
+
+
 def train_one_fold(
     X_tr, y_tr, w_tr, X_va, y_va, arch: str, n_classes: int,
     epochs: int, batch_size: int, lr: float, patience: int, seed: int,
+    augment: bool = False, label_smoothing: float = 0.0,
+    channels: int = 96, kernel_size: int = 3, dropout: float = 0.2,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = make_model(arch, X_tr.shape[2], n_classes).to(DEVICE)
+    if arch == "tcn":
+        model = TCN(X_tr.shape[2], n_classes, channels=channels,
+                    kernel_size=kernel_size, dropout=dropout).to(DEVICE)
+    else:
+        model = make_model(arch, X_tr.shape[2], n_classes).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    crit = nn.CrossEntropyLoss(reduction="none")
+    crit = nn.CrossEntropyLoss(reduction="none", label_smoothing=label_smoothing)
 
     Xt = torch.tensor(X_tr, dtype=torch.float32)
     yt = torch.tensor(y_tr, dtype=torch.long)
@@ -122,6 +159,8 @@ def train_one_fold(
         model.train()
         for xb, yb, wb in dl:
             xb, yb, wb = xb.to(DEVICE), yb.to(DEVICE), wb.to(DEVICE)
+            if augment:
+                xb = augment_batch(xb)
             opt.zero_grad()
             loss = (crit(model(xb), yb) * wb).mean()
             loss.backward()
@@ -163,6 +202,12 @@ def main():
                     choices=["max_inverse", "sklearn_balanced"])
     ap.add_argument("--non-idle-weight-mult", type=float, default=1.0)
     ap.add_argument("--serve-weight-mult", type=float, default=1.0)
+    ap.add_argument("--augment", action="store_true",
+                    help="On-the-fly augmentation: speed perturbation, frame dropout, gaussian noise")
+    ap.add_argument("--label-smoothing", type=float, default=0.0)
+    ap.add_argument("--channels", type=int, default=96, help="TCN channels")
+    ap.add_argument("--kernel-size", type=int, default=3, help="TCN kernel size")
+    ap.add_argument("--dropout", type=float, default=0.2, help="TCN dropout")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -192,6 +237,8 @@ def main():
         _, proba_va, best_f1 = train_one_fold(
             Xn_tr, y[tr], sw, Xn_va, y[va], args.arch, n_classes,
             args.epochs, args.batch_size, args.lr, args.patience, seed=42 + fi,
+            augment=args.augment, label_smoothing=args.label_smoothing,
+            channels=args.channels, kernel_size=args.kernel_size, dropout=args.dropout,
         )
         proba_oof[va] = proba_va
         pred_va = proba_va.argmax(axis=1)
@@ -224,6 +271,9 @@ def main():
             "patience": args.patience, "weight_scheme": args.weight_scheme,
             "non_idle_weight_mult": args.non_idle_weight_mult,
             "serve_weight_mult": args.serve_weight_mult,
+            "augment": args.augment, "label_smoothing": args.label_smoothing,
+            "channels": args.channels, "kernel_size": args.kernel_size,
+            "dropout": args.dropout,
             "classes": class_names, "class_counts": dict(Counter(lbls)),
             "input_shape": list(X.shape[1:]),
         },
