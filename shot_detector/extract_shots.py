@@ -587,8 +587,13 @@ def extract_clip_and_pose(video_path, start_frame, duration, inferencer, K=None,
         if return_all_poses:
             return None, None, None, None
         return None, None
-    
+
     # Seek to start frame
+    # WARNING: CAP_PROP_POS_FRAMES is frame-INACCURATE on VFR videos
+    # (rpi cams: r_frame_rate=250 vs avg ~30.005; LU + 0529 videos). Lands up
+    # to +-20 frames off, offset varies along the video, so extracted poses can
+    # lag annotations/ball trajectories. Sequential decode is the only exact
+    # fix; preferred path is extract_shots_from_intermediate.py (no video read).
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     img_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     img_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

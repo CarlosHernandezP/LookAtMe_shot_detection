@@ -123,10 +123,12 @@ def main():
         if not video_path or not os.path.exists(video_path):
             print(f"  WARN no video for {mk}/{cam}, skipping {len(items)} clips")
             continue
-        cap = cv2.VideoCapture(video_path)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # Plan all windows up-front, then make ONE sequential decode pass.
+        # cv2 CAP_PROP_POS_FRAMES seeking is frame-INACCURATE on the VFR videos
+        # (r_frame_rate=250 vs avg ~30.005): poses_raw frame_num is a sequential
+        # decode index, so only sequential reading lines the overlays up.
+        windows = []  # (start, end, clip dict)
         for cls, csv_path, _, _, center, label in items:
             start = max(0, center - WINDOW_BEFORE)
             pid2track = {}
@@ -134,8 +136,8 @@ def main():
                 for r in reid_by_frame.get(fr, []):
                     pid2track[(fr, r["player_id"])] = r["object_id"]
 
-            def pose_at(fr, pid):
-                tid = pid2track.get((fr, pid))
+            def pose_at(fr, pid, _p2t=pid2track):
+                tid = _p2t.get((fr, pid))
                 return poses_by_frame.get(fr, {}).get(tid) if tid is not None else None
 
             all_pids = {r["player_id"] for fr in range(start, start + WINDOW_LEN)
@@ -149,33 +151,60 @@ def main():
             if active_pid is None:
                 print(f"  WARN no active pid for {cls}@{center}, skipping")
                 continue
-
             out_name = f"{cls}_{os.path.basename(csv_path)[:-4]}_{center}_{label}.mp4"
-            out_path = os.path.join(args.out_dir, out_name)
-            vw = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            for i in range(WINDOW_LEN):
+            windows.append({
+                "start": start, "end": start + WINDOW_LEN, "cls": cls, "label": label,
+                "active_pid": active_pid, "idle_pid": idle_pid, "pose_at": pose_at,
+                "out_name": out_name, "writer": None,
+            })
+
+        if not windows:
+            continue
+        last_needed = max(wd["end"] for wd in windows)
+        cap = cv2.VideoCapture(video_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fr = 0
+        while fr < last_needed:
+            active_windows = [wd for wd in windows if wd["start"] <= fr < wd["end"]]
+            if active_windows:
                 ok, frame = cap.read()
-                if not ok:
-                    break
-                fr = start + i
+            else:
+                ok = cap.grab()
+                frame = None
+            if not ok:
+                break
+            for wd in active_windows:
+                if wd["writer"] is None:
+                    wd["writer"] = cv2.VideoWriter(
+                        os.path.join(args.out_dir, wd["out_name"]),
+                        cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
+                img = frame.copy()
                 reid_recs = {r["player_id"]: r for r in reid_by_frame.get(fr, [])}
-                a_rec = reid_recs.get(active_pid)
-                draw_player(frame, pose_at(fr, active_pid),
-                            a_rec["bbox"] if a_rec else None, (0, 255, 0), f"ACTIVE pid={active_pid}")
-                if idle_pid is not None:
-                    i_rec = reid_recs.get(idle_pid)
-                    draw_player(frame, pose_at(fr, idle_pid),
-                                i_rec["bbox"] if i_rec else None, (255, 128, 0), f"IDLE pid={idle_pid}")
-                cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
-                cv2.putText(frame, f"{cls}  label={label}  frame={fr}  ACTIVE=green IDLE=blue",
+                a_rec = reid_recs.get(wd["active_pid"])
+                draw_player(img, wd["pose_at"](fr, wd["active_pid"]),
+                            a_rec["bbox"] if a_rec else None, (0, 255, 0), f"ACTIVE pid={wd['active_pid']}")
+                if wd["idle_pid"] is not None:
+                    i_rec = reid_recs.get(wd["idle_pid"])
+                    draw_player(img, wd["pose_at"](fr, wd["idle_pid"]),
+                                i_rec["bbox"] if i_rec else None, (255, 128, 0), f"IDLE pid={wd['idle_pid']}")
+                cv2.rectangle(img, (0, 0), (w, 40), (0, 0, 0), -1)
+                cv2.putText(img, f"{wd['cls']}  label={wd['label']}  frame={fr}  ACTIVE=green IDLE=blue",
                             (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                vw.write(frame)
-            vw.release()
-            manifest.append({"class": cls, "clip": out_name, "label": label,
-                             "active_pid": int(active_pid),
-                             "idle_pid": int(idle_pid) if idle_pid is not None else None})
-            print(f"  OK {out_name}")
+                wd["writer"].write(img)
+                if fr == wd["end"] - 1:
+                    wd["writer"].release()
+                    manifest.append({"class": wd["cls"], "clip": wd["out_name"], "label": wd["label"],
+                                     "active_pid": int(wd["active_pid"]),
+                                     "idle_pid": int(wd["idle_pid"]) if wd["idle_pid"] is not None else None})
+                    print(f"  OK {wd['out_name']}")
+            fr += 1
+        for wd in windows:
+            if wd["writer"] is not None:
+                try:
+                    wd["writer"].release()
+                except Exception:
+                    pass
         cap.release()
 
     with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
