@@ -14,6 +14,8 @@ from shot_detector.track_metrics import (
     save_track_metrics_json,
 )
 from shot_detector.utils import parse_shot_csv, get_video_path, identify_player, get_idle_player
+from shot_detector.players_reid_io import load_players_reid_by_frame
+from shot_detector.pose_reid_match import match_poses_to_reid
 from shot_detector.utils import load_fisheye_params, load_perspective_matrix, transform_points, get_foot_position
 from shot_detector.ball_features import normalize_ball_features, get_ball_feature_names
 from shot_detector.pose_geometry import joint_angles_rad_from_body12
@@ -56,6 +58,25 @@ BALL_TRAJECTORY_MAP = {
     },
     '18dda9d2-baba-4920-a642-d0a9838d01f3': {
         'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3_rpi_BO-2226_ball_trajectory.csv',
+    },
+}
+
+# players_reid.csv lives in the LookAtMeProtoApp pipeline output tree.
+# Map: annotation/video substring -> {camera_id: relative path under PLAYERS_REID_ROOT}
+PLAYERS_REID_ROOT = '/home/ec2-user/carlos/LookAtMeProtoApp/data/intermediate'
+PLAYERS_REID_MAP = {
+    '0529b769-125d-4a22-bcee-b1707b87447e': {
+        'BO-0001': '0529b769-125d-4a22-bcee-b1707b87447e/BO-0001/players_reid.csv',
+        'BO-0002': '0529b769-125d-4a22-bcee-b1707b87447e/BO-0002/players_reid.csv',
+    },
+    '15-11-2025-15-57_rpi-BO-0001': {
+        'BO-0001': '15-11-2025-15-57_rpi-BO-0001/BO-0001/players_reid.csv',
+    },
+    '22-11-2025-18-10_rpi-LU-0002': {
+        'LU-0002': '22-11-2025-18-10_rpi-LU-0002/LU-0002/players_reid.csv',
+    },
+    '18dda9d2-baba-4920-a642-d0a9838d01f3': {
+        'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3/BO-2226/players_reid.csv',
     },
 }
 
@@ -1579,6 +1600,17 @@ def main():
         default=0,
         help='Append N raw frames to the MP4 clip AFTER the pose window ends. CSV stays at 30 frames. Use 45 for +1.5s @ 30fps.',
     )
+    parser.add_argument(
+        '--use-reid',
+        action='store_true',
+        help='Override active/idle pose picks per frame by IoU-matching against players_reid.csv. Falls back to the heuristic per frame when no IoU match.',
+    )
+    parser.add_argument(
+        '--reid-iou-threshold',
+        type=float,
+        default=0.3,
+        help='Minimum IoU between a pose bbox and a reid bbox to accept a match (default 0.3).',
+    )
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -1697,7 +1729,32 @@ def main():
                         tqdm.write(f"Loaded {len(trajectories)} ball trajectories for {video_name} (camera: {camera_id})")
                 else:
                     tqdm.write(f"Warning: trajectory file not found: {ball_csv_path}")
-        
+
+        # Load players_reid for this (video, camera) when --use-reid is set.
+        reid_by_frame = {}
+        if args.use_reid:
+            reid_matched_key = None
+            for vk in PLAYERS_REID_MAP:
+                if vk in video_name or vk in csv_path:
+                    reid_matched_key = vk
+                    break
+            if reid_matched_key:
+                reid_cam_map = PLAYERS_REID_MAP[reid_matched_key]
+                reid_cam = None
+                for cam_id in reid_cam_map:
+                    if cam_id in video_name or cam_id in csv_path:
+                        reid_cam = cam_id
+                        break
+                if reid_cam is None and len(reid_cam_map) == 1:
+                    reid_cam = list(reid_cam_map.keys())[0]
+                if reid_cam and reid_cam in reid_cam_map:
+                    reid_path = os.path.join(PLAYERS_REID_ROOT, reid_cam_map[reid_cam])
+                    if os.path.exists(reid_path):
+                        reid_by_frame = load_players_reid_by_frame(reid_path)
+                        tqdm.write(f"Loaded {len(reid_by_frame)} reid frames for {video_name} (camera: {reid_cam})")
+                    else:
+                        tqdm.write(f"Warning: reid file not found: {reid_path}")
+
         # Group by row to process each shot
         # Convert to list to use tqdm
         rows = list(df.iterrows())
@@ -1893,6 +1950,61 @@ def main():
                                 break
                 
                 tracked_idle_indices[i] = idle_match_idx
+
+            # --- Reid override (when --use-reid) ---
+            # IoU-match poses against players_reid.csv per frame. Lock active/idle
+            # player_id at the center frame; per frame, replace the heuristic pick
+            # with the pose mapped to that player_id. Frames with no IoU match
+            # keep the heuristic pick (fallback) and are counted.
+            reid_fallback_count_active = 0
+            reid_fallback_count_idle = 0
+            reid_used = False
+            reid_active_pid = None
+            reid_idle_pid = None
+            if args.use_reid and reid_by_frame:
+                # Match at center frame
+                center_pose_bboxes = [unwrap_bbox(p['bbox']) for p in poses_per_frame[center_idx_in_clip]]
+                center_reid_recs = reid_by_frame.get(start_frame + center_idx_in_clip, [])
+                center_pids = match_poses_to_reid(
+                    center_pose_bboxes, center_reid_recs, iou_threshold=args.reid_iou_threshold
+                )
+                if 0 <= active_idx_initial < len(center_pids):
+                    reid_active_pid = center_pids[active_idx_initial]
+                if idle_idx_initial != -1 and 0 <= idle_idx_initial < len(center_pids):
+                    reid_idle_pid = center_pids[idle_idx_initial]
+
+                if reid_active_pid is not None:
+                    reid_used = True
+                    for i in range(len(frames)):
+                        poses = poses_per_frame[i]
+                        if not poses:
+                            continue
+                        pose_bboxes_i = [unwrap_bbox(p['bbox']) for p in poses]
+                        reid_recs_i = reid_by_frame.get(start_frame + i, [])
+                        pids = match_poses_to_reid(
+                            pose_bboxes_i, reid_recs_i, iou_threshold=args.reid_iou_threshold
+                        )
+                        # Active
+                        new_act = -1
+                        for pi, pid in enumerate(pids):
+                            if pid == reid_active_pid:
+                                new_act = pi
+                                break
+                        if new_act != -1:
+                            tracked_active_indices[i] = new_act
+                        else:
+                            reid_fallback_count_active += 1
+                        # Idle
+                        if reid_idle_pid is not None:
+                            new_idl = -1
+                            for pi, pid in enumerate(pids):
+                                if pid == reid_idle_pid and pi != new_act:
+                                    new_idl = pi
+                                    break
+                            if new_idl != -1:
+                                tracked_idle_indices[i] = new_idl
+                            else:
+                                reid_fallback_count_idle += 1
 
             # NOW match ball trajectory to active player (after tracking is complete)
             # Build active player pose sequence (only active player, not idle/invalid)
@@ -2166,6 +2278,14 @@ def main():
             track_quality['handedness'] = {
                 'mirrored_active_frames': mirrored_active_frames,
                 'mirrored_idle_frames': mirrored_idle_frames,
+            }
+            track_quality['reid'] = {
+                'used': bool(reid_used),
+                'active_player_id': reid_active_pid,
+                'idle_player_id': reid_idle_pid,
+                'fallback_frames_active': int(reid_fallback_count_active),
+                'fallback_frames_idle': int(reid_fallback_count_idle),
+                'iou_threshold': float(args.reid_iou_threshold) if args.use_reid else None,
             }
             metrics_filename = f"{video_name}_{center_frame}_{shot_type}_{player_label}_track_metrics.json"
             save_track_metrics_json(track_quality, os.path.join(output_dir, metrics_filename))
