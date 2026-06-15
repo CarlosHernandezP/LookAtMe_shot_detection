@@ -7,8 +7,8 @@ import os
 import glob
 import pandas as pd
 
-# Raw shot labels (from filenames) -> model class. ``wall_shot`` is only ``forehand_contrapared``;
-# wall exits / wall lobs map to forehand or backhand.
+# Raw shot labels (from filenames) -> model class. ``wall_shot`` covers both
+# forehand/backhand contrapared; wall exits / wall lobs map to forehand or backhand.
 DEFAULT_SHOT_MAPPING: Dict[str, List[str]] = {
     "forehand": [
         "forehand",
@@ -35,7 +35,7 @@ DEFAULT_SHOT_MAPPING: Dict[str, List[str]] = {
     "bandeja": ["bandeja"],
     "vibora": ["vibora"],
     "idle": ["idle"],
-    "wall_shot": ["forehand_contrapared"],
+    "wall_shot": ["forehand_contrapared", "backhand_contrapared"],
 }
 
 

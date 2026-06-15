@@ -1,71 +1,83 @@
 # Production False-Positive Eval — Findings (2026-06-15)
 
-Full-match, production-stride eval of the shot classifier on held-out match
-`a145dd19` (BO-2222, 54000 frames, 146 annotated shots, both close players).
-Harness: `stats-poc/tools/eval_shot_fp_fullmatch.py` (reuses production
-`predict_shots` → `smooth_predictions` → `find_shot_segments`).
+Production-realistic, full-match eval of the shot classifier. Harness:
+`stats-poc/tools/eval_shot_fp_fullmatch.py` (reuses production `predict_shots`
+→ `smooth_predictions` → `find_shot_segments`), per-shot-type metrics,
+leave-one-match-out (LOO) so each held-out match is leakage-free.
 
-## The problem is real and reproduced
+## TL;DR
 
-Running the **deployed May XGB** (leakage-free — a145dd19 not in its training)
-over the whole match with the CURRENT segmenter:
+1. The over-counting is **real and reproduces across all 5 matches** (2–4×
+   inflation at the current segmenter, leakage-free).
+2. The segmenter had a genuine bug (no duration/confidence floor) — **fixed**
+   (`find_shot_segments_hardened`), model-agnostic, shipped to stats-poc.
+3. Reverting `non_idle_weight_mult` (1.918 → 1.0) helps — confirmed directionally.
+4. **BUT we cannot trust the precision / false-positive numbers**: the
+   annotations are incomplete (~6–10 shots/min vs ~15–40/min for real active
+   padel — only ~25–50% of shots labelled). Most "false positives" are real,
+   unannotated shots. **The measurement instrument is inadequate for the FP
+   question.** Threshold tuning for precision is therefore NOT reliable yet.
 
-- **276 shots emitted vs 146 annotated = 1.89x inflation**
-- precision **0.49**, recall 0.93
+## Leakage matters
 
-Half of all reported shots are false. Matches the production complaint exactly.
+Earlier in-training eval (a145dd19 in the training set) suggested precision
+~0.63. Leakage-free LOO across 5 matches: overall detection precision tops out
+~0.44–0.52 — much worse. The model overfits to seen courts/players; each new
+venue degrades it. **LOO is the production-relevant number.**
 
-## Root cause (confirmed in code)
+## Pooled LOO sweep (5 matches, 2246 annotated shots, 353 serves)
 
-`find_shot_segments` counts a shot for **any** smoothed window whose argmax is
-non-idle — **no minimum duration, no confidence floor**. A real swing sustains
-across several windows; a walking hand-wave is one window. Both count as +1.
-Every brief misclassification becomes a counted shot.
+| pick | mw | cf | overall P | overall R | serve P | serve R |
+|---|---|---|---|---|---|---|
+| best overall F1 | 3 | 0.0 | 0.44 | 0.60 | 0.16 | 0.34 |
+| best overall precision | 3 | 0.8 | 0.52 | 0.18 | 0.15 | 0.07 |
+| best serve F1 | 2 | 0.0 | 0.36 | 0.74 | 0.15 | 0.46 |
 
-## Fix shipped: hardened segmenter
+Recall is the trustworthy axis (of annotated shots, how many found):
+**overall 60–81%, serve 34–53%.** Serve recall is independently weak on
+unseen matches — that part is not an annotation artifact.
 
-`find_shot_segments_hardened` (in `stats-poc/src/utils/shot_segment_counter.py`)
-keeps a segment only if it spans `>= min_windows` windows AND reaches
-`min_peak_confidence`. Sweep on deployed XGB:
+## Serve false-positives are spurious, not confusion (15-11 fold)
 
-| config | emitted | inflation | precision | recall |
-|---|---|---|---|---|
-| current (mw=1, cf=0) | 276 | 1.89x | 0.49 | 0.93 |
-| mw=2, cf=0 | 213 | 1.46x | 0.60 | 0.88 |
-| mw=3, cf=0 | 124 | 0.85x | 0.73 | 0.62 |
-| mw=1, cf=0.7 | 78 | 0.53x | 0.78 | 0.42 |
+Of 82 detected serves: 12 near a real serve, **0 confused with another shot
+type, 70 in dead time**. Even at ±10 s tolerance, 51/82 are >10 s from ANY
+annotation. So serve FPs are the model calling "serve" during
+between-point / ready / walking moments — OR real serves the annotation
+missed. With incomplete annotations we cannot separate these two.
 
-Hardening roughly halves false positives. But there's a **precision/recall
-wall**: pushing precision past ~0.73 collapses recall, because the per-window
-prediction stream itself is noisy.
+## Why the annotations can't measure FP
 
-## The bigger finding: training objective is misaligned with production
+Shots/min per annotation file: 5.7, 9.4, 6.5, 6.6, 9.9, 7.9, 9.6, 7.5.
+Real active padel ≈ 15–40 shots/min. The labels capture a subset, so any
+detection that doesn't hit a label is ambiguous: false positive OR real
+unannotated shot. Precision is a lower bound, badly contaminated.
 
-The hard-negative XGB (`xgb_hardneg`, idle-enriched) is actually **worse** on
-raw count here (337 emitted, 2.31x, precision 0.35) than the old model. Cause:
-we trained every model with `non_idle_weight_mult=1.918` (up-weights shots to
-balance macro-F1). That bias is exactly wrong for "do not over-count shots" —
-it makes the model eager to fire. The whole session optimized **macro-F1 on a
-balanced split**, which is not the production objective.
+## What stands (independent of the annotation issue)
 
-Two structural fixes beyond segmentation (deferred earlier, now clearly needed):
+- **Segmenter fix** (`find_shot_segments_hardened`): a flicker is one window,
+  a real swing sustains — requiring ≥`min_windows` and a confidence floor is
+  correct regardless of how precision is measured. Ship it.
+- **Revert `non_idle_weight_mult`**: training up-weighted shots, biasing toward
+  firing — wrong for "don't over-count". Reverted in all current models.
+- **Serve recall is genuinely low** on unseen courts → needs data/features.
 
-1. **Retrain favoring idle**, not against it: drop `non_idle_weight_mult`,
-   consider up-weighting idle, OR apply prior correction at inference
-   (× production/train idle prior) — the base-rate fix we listed but skipped.
-2. **Confidence floor is mandatory** at deploy: the hardneg model only behaves
-   with `min_peak_confidence ~0.7` (precision 0.71, emitted 121 vs 146).
+## Real next steps (not threshold tuning)
 
-## Recommended immediate deploy (model-agnostic)
+1. **Get a properly measurable test set**: one match with EVERY shot annotated,
+   OR human-review a random sample of the model's detections to estimate true
+   precision. Until then FP cannot be quantified.
+2. **Serve**: more serve training data + a court-position / serve-zone feature
+   (serves start from behind the baseline; pose-only windows lack this).
+   Likely needs rally/point structure, not just per-window pose.
+3. **More venue diversity** in training (5 matches; LOO shows each new court
+   breaks generalization).
 
-`find_shot_segments_hardened(min_windows=2, min_peak_confidence=0.6)` — cuts
-inflation toward 1.0x without destroying recall. **Tune on YOUR deployed model**
-with the harness; optimal floor is model-specific (old XGB likes mw=3/cf=0,
-hardneg likes cf=0.7).
+## Artifacts
 
-## Honest caveat
-
-This proves the segmenter was a major bug and the hardening helps a lot, but it
-does NOT fully solve over-counting on its own — the per-window model needs the
-prior-correction / idle-favoring retrain to break the precision/recall wall.
-Recall numbers also depend on event-match tolerance (±30 frames here).
+- Harness + per-class eval: `stats-poc/tools/eval_shot_fp_fullmatch.py`
+- LOO drivers: `LookAtMe shot_detector/tools/run_loo_tcn.sh`,
+  `stats-poc/tools/run_loo_eval.sh`, `tools/aggregate_loo_sweep.py`
+- Hardened segmenter: `stats-poc/src/utils/shot_segment_counter.py`
+  (branch `fix/shot-segment-fp-floor`)
+- LOO + full-data no-weight TCN bundles: `shot_detector/runs/tcn_loo_*`,
+  `shot_detector/runs/tcn_final_noweight`
