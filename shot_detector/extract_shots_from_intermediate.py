@@ -33,6 +33,36 @@ from collections import Counter, defaultdict
 
 import pandas as pd
 
+COURT_LENGTH_M = 20.0  # baseline-to-baseline; net at 10m. court_y in [0, 20].
+
+
+def _court_xy(reid_by_frame, fr, pid):
+    """(court_x, court_y) of player_id at frame, or (nan, nan)."""
+    for r in reid_by_frame.get(fr, []):
+        if r["player_id"] == pid:
+            return r["court_x"], r["court_y"]
+    return float("nan"), float("nan")
+
+
+def append_court_columns(csv_path, court_seq):
+    """
+    Append court_x, court_y, dist_to_near_baseline columns to a saved pose CSV.
+    court_seq is a list of (court_x, court_y) per frame, aligned with the CSV rows
+    (forward-filled to match the pose forward-fill). NaN where unavailable.
+    """
+    import numpy as np
+    df = pd.read_csv(csv_path)
+    n = len(df)
+    cx = np.array([c[0] for c in court_seq[:n]], dtype=float)
+    cy = np.array([c[1] for c in court_seq[:n]], dtype=float)
+    # forward/back fill so a missing court value mirrors the pose fill behaviour
+    s_cx = pd.Series(cx).ffill().bfill()
+    s_cy = pd.Series(cy).ffill().bfill()
+    df["court_x"] = s_cx.to_numpy()
+    df["court_y"] = s_cy.to_numpy()
+    df["dist_to_near_baseline"] = np.minimum(s_cy.to_numpy(), COURT_LENGTH_M - s_cy.to_numpy())
+    df.to_csv(csv_path, index=False)
+
 from shot_detector.extract_shots import (
     BALL_TRAJECTORY_DIR,
     BALL_TRAJECTORY_MAP,
@@ -223,10 +253,13 @@ def main():
             idle_pid = next((p for p in candidates if p != active_pid), None)
 
             active_seq, idle_seq = [], []
+            active_court, idle_court = [], []
             last_a = last_i = None
             miss_a = miss_i = 0
             for i, fr in enumerate(range(start, start + WINDOW_LEN)):
                 ma, mi = handedness_mirror_active_idle(csv_path, fr, label)
+                active_court.append(_court_xy(reid_by_frame, fr, active_pid))
+                idle_court.append(_court_xy(reid_by_frame, fr, idle_pid) if idle_pid is not None else (float("nan"), float("nan")))
 
                 pa = pose_at(fr, active_pid)
                 if pa is not None:
@@ -262,13 +295,17 @@ def main():
                             )
 
             base = f"{video_name}_{center}_{shot_type}_{label}"
-            save_pose_csv(active_seq, os.path.join(args.output_dir, f"{base}_pose.csv"),
+            active_path = os.path.join(args.output_dir, f"{base}_pose.csv")
+            save_pose_csv(active_seq, active_path,
                           image_width=img_w, image_height=img_h,
                           ball_positions=ball_positions or None, start_frame=start)
+            append_court_columns(active_path, active_court)
             if any(p is not None for p in idle_seq):
-                save_pose_csv(idle_seq, os.path.join(args.output_dir, f"{video_name}_{center}_idle_{label}_pose.csv"),
+                idle_path = os.path.join(args.output_dir, f"{video_name}_{center}_idle_{label}_pose.csv")
+                save_pose_csv(idle_seq, idle_path,
                               image_width=img_w, image_height=img_h,
                               ball_positions=ball_positions or None, start_frame=start)
+                append_court_columns(idle_path, idle_court)
             totals["exported"] += 1
             totals["with_ball"] += bool(ball_positions)
 

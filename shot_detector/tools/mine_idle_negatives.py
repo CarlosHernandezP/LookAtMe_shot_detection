@@ -36,6 +36,8 @@ from shot_detector.extract_shots_from_intermediate import (
     MAX_FORWARD_FILL,
     WINDOW_BEFORE,
     WINDOW_LEN,
+    _court_xy,
+    append_court_columns,
     load_poses_for_frames,
     resolve_match_cam,
 )
@@ -135,9 +137,10 @@ def main():
             candidates = [pid for pid, cov in sorted(pid_cov.items(), key=lambda kv: -kv[1])
                           if cov >= args.min_coverage][:2]
             for pid in candidates:
-                seq = []
+                seq, court = [], []
                 last, miss = None, 0
                 for fr in range(start, start + WINDOW_LEN):
+                    court.append(_court_xy(reid_by_frame, fr, pid))
                     p = pose_at(fr, pid)
                     if p is not None:
                         last, miss = p, 0
@@ -157,6 +160,7 @@ def main():
                     out = os.path.join(args.output_dir, f"{video_name}_{c + 1}_idle_{side}_pose.csv")
                 save_pose_csv(seq, out, image_width=img_w, image_height=img_h,
                               ball_positions=None, start_frame=start)
+                append_court_columns(out, court)
                 totals["samples"] += 1
         totals["windows"] += len(centers)
 

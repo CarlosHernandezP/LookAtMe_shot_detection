@@ -41,6 +41,69 @@ from shot_detector.train_shot_model import (
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+COURT_COLS_ALL = ["court_y", "court_x", "dist_to_near_baseline"]
+
+
+def load_dataset_with_court(data_dir, min_samples, court_cols, exclude_token=None, only_token=None):
+    """
+    Like load_dataset_wall_flat but appends selected court columns per frame to the
+    base 41 features. court_cols is an ordered subset of COURT_COLS_ALL. Court values
+    are z-normless here (the trainer z-norms everything). Missing court -> 0.
+    exclude_token / only_token filter files by substring (for leave-one-match-out).
+    Returns (sequences (N,30,41+k), labels).
+    """
+    import glob
+    import os
+    from collections import Counter
+
+    import pandas as pd
+    from shot_detector.ball_features import get_ball_feature_names
+    from shot_detector.pose_io import N_FEATURES_RAW, load_pose_csv, pad_or_trim_sequence
+    from shot_detector.shot_mapper import DEFAULT_SHOT_MAPPING, extract_shot_type_from_filename, map_shot_to_class
+
+    seq_len = 30
+    n_ball = len(get_ball_feature_names())
+    files = sorted(glob.glob(os.path.join(data_dir, "*_pose.csv")))
+    sequences, labels = [], []
+    for path in files:
+        bn = os.path.basename(path)
+        if exclude_token and exclude_token in bn:
+            continue
+        if only_token and only_token not in bn:
+            continue
+        raw = extract_shot_type_from_filename(path)
+        if not raw:
+            continue
+        mapped = map_shot_to_class(raw, DEFAULT_SHOT_MAPPING)
+        if mapped is None:
+            continue
+        feats = load_pose_csv(path)
+        if feats is None or feats.shape[1] < N_FEATURES_RAW:
+            continue
+        feats = pad_or_trim_sequence(feats[:, :N_FEATURES_RAW])
+        if mapped != "idle" and np.all(np.isnan(feats[:, -n_ball:])):
+            continue
+        if court_cols:
+            df = pd.read_csv(path, usecols=lambda c: c in court_cols)
+            court = df[court_cols].to_numpy(dtype=np.float32)
+            court = pad_or_trim_sequence(court)
+            court = np.nan_to_num(court, nan=0.0)
+            feats = np.concatenate([feats, court], axis=1)
+        sequences.append(feats)
+        labels.append(mapped)
+    if not sequences:
+        raise ValueError(f"No usable pose CSVs in {data_dir}")
+    sequences = np.array(sequences)
+    labels = np.array(labels)
+    counts = Counter(labels)
+    keep = {c for c, n in counts.items() if n >= min_samples}
+    mask = np.array([l in keep for l in labels])
+    sequences, labels = sequences[mask], labels[mask]
+    print(f"Loaded {len(sequences)} seqs, court_cols={court_cols} -> feat dim {sequences.shape[2]}")
+    for cls, cnt in sorted(Counter(labels).items(), key=lambda x: -x[1]):
+        print(f"  {cls:<12} {cnt:>5}")
+    return sequences, labels
+
 
 class TCN(nn.Module):
     """Dilated temporal conv stack -> global average pool -> linear head."""
@@ -187,6 +250,60 @@ def train_one_fold(
     return model, proba, best_f1
 
 
+def run_heldout_ablation(args, court_cols):
+    """
+    Train on all matches except --heldout-token, then test on the held-out
+    match's annotated shot windows. Reports per-class recall (esp. serve).
+    This isolates whether court features improve shot discrimination on an
+    unseen court, sidestepping the FP/precision question (annotations are
+    incomplete; recall is the trustworthy axis).
+    """
+    tok = args.heldout_token
+    Xtr_s, ytr = load_dataset_with_court(args.data_dir, args.min_samples, court_cols, exclude_token=tok)
+    Xte_s, yte = load_dataset_with_court(args.data_dir, 1, court_cols, only_token=tok)
+    Xtr = np.nan_to_num(Xtr_s.astype(np.float32), nan=0.0)
+    Xte = np.nan_to_num(Xte_s.astype(np.float32), nan=0.0)
+
+    le = LabelEncoder()
+    ytr_e = le.fit_transform(ytr)
+    classes = le.classes_.tolist()
+    # held-out labels may include classes; map, drop any unseen
+    keep = np.array([l in classes for l in yte])
+    Xte, yte = Xte[keep], yte[keep]
+    yte_e = np.array([classes.index(l) for l in yte])
+
+    mu = Xtr.reshape(-1, Xtr.shape[2]).mean(axis=0)
+    sd = Xtr.reshape(-1, Xtr.shape[2]).std(axis=0) + 1e-6
+    Xtr_n, Xte_n = (Xtr - mu) / sd, (Xte - mu) / sd
+    sw = compute_sample_weights(ytr_e, le.classes_, args.serve_weight_mult,
+                                args.non_idle_weight_mult, weight_scheme=args.weight_scheme)
+    model, _, _ = train_one_fold(
+        Xtr_n, ytr_e, sw, Xte_n, yte_e, args.arch, len(classes),
+        args.epochs, args.batch_size, args.lr, args.patience, seed=4242,
+        augment=args.augment, label_smoothing=args.label_smoothing,
+        channels=args.channels, kernel_size=args.kernel_size, dropout=args.dropout,
+    )
+    model.eval()
+    with torch.no_grad():
+        pred = model(torch.tensor(Xte_n, device=DEVICE)).argmax(1).cpu().numpy()
+
+    rep = classification_report(yte_e, pred, labels=range(len(classes)),
+                                target_names=classes, zero_division=0, output_dict=True)
+    out = {"heldout": tok, "court_cols": court_cols, "feat_dim": int(Xtr.shape[2]),
+           "n_test": int(len(yte_e)), "per_class": {}}
+    print(f"\n=== HELD-OUT {tok}  court={court_cols or 'none'}  featdim={Xtr.shape[2]}  n_test={len(yte_e)} ===")
+    print(f"{'class':<12} {'recall':>7} {'prec':>7} {'n':>5}")
+    for c in classes:
+        r = rep[c]
+        out["per_class"][c] = {"recall": r["recall"], "precision": r["precision"], "n": int(r["support"])}
+        mark = "  <== SERVE" if c == "serve" else ""
+        print(f"{c:<12} {r['recall']:>7.3f} {r['precision']:>7.3f} {int(r['support']):>5}{mark}")
+    out["accuracy"] = float(rep["accuracy"])
+    out["serve_recall"] = rep["serve"]["recall"] if "serve" in rep else None
+    print(f"overall accuracy {rep['accuracy']:.3f}  |  serve recall {out['serve_recall']}")
+    Path(args.output_dir, f"ablation_{tok}_{'-'.join(court_cols) or 'base'}.json").write_text(json.dumps(out, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
@@ -210,12 +327,25 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.2, help="TCN dropout")
     ap.add_argument("--save-model", action="store_true",
                     help="After CV: refit on ALL data (with an internal early-stop split) and export weights + z-norm stats + meta")
+    ap.add_argument("--court-features", type=str, default="",
+                    help="Comma list of court columns to append: court_y, court_x, dist_to_near_baseline")
+    ap.add_argument("--heldout-token", type=str, default=None,
+                    help="If set: train on data excluding this match token, then report per-class recall on that match's annotated shot windows (ablation mode)")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seqs, lbls = load_dataset_wall_flat(args.data_dir, args.min_samples)
+    court_cols = [c.strip() for c in args.court_features.split(",") if c.strip()]
+
+    if args.heldout_token:
+        run_heldout_ablation(args, court_cols)
+        return
+
+    if court_cols:
+        seqs, lbls = load_dataset_with_court(args.data_dir, args.min_samples, court_cols)
+    else:
+        seqs, lbls = load_dataset_wall_flat(args.data_dir, args.min_samples)
     X = np.nan_to_num(seqs.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     le = LabelEncoder()
     y = le.fit_transform(lbls)
