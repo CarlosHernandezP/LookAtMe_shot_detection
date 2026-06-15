@@ -81,3 +81,40 @@ unannotated shot. Precision is a lower bound, badly contaminated.
   (branch `fix/shot-segment-fp-floor`)
 - LOO + full-data no-weight TCN bundles: `shot_detector/runs/tcn_loo_*`,
   `shot_detector/runs/tcn_final_noweight`
+
+## Court-position features for serves (2026-06-15, update)
+
+Serves happen behind a baseline. Added court position from `players_reid.csv`
+as TCN channels and ablated by held-out match (train on 4, test per-class
+recall on the 5th's annotated shot windows — clean: classifying labelled
+windows, not the contaminated sliding-window FP).
+
+**Key geometric finding (Carlos's catch):** the LU-0002 camera watches the
+OPPOSITE baseline from the BO cameras. Close players (and servers) sit at
+`court_y ≈ 18` on BO cameras but `court_y ≈ 2` on LU. The calibration is
+CORRECT — `court_y` is just camera-mounting-dependent, so raw `court_y` does
+NOT transfer across mountings. `dist_to_near_baseline = min(court_y, 20-court_y)`
+≈ 2.0 for serves on EVERY court → that is the camera-invariant signal.
+
+Serve recall / precision by held-out match (TCN, 128ch):
+
+| feature set | 22-11 (LU) | 18dda9d2 (BO) | 15-11 (BO) |
+|---|---|---|---|
+| base (41) | 0.085 / 0.114 | 0.68-0.73 / 0.49-0.53 | 0.957 / 0.721 |
+| +court_y,court_x | 0.021 (hurt) | 0.798 / 0.635 | 0.870 (hurt recall) |
+| +dist_to_baseline,court_x | **0.149 / 0.175** | 0.734 / 0.537 | (not run) |
+
+- Raw `court_y` is mounting-dependent → inconsistent (helped 18dda9d2, hurt LU
+  and 15-11). DO NOT use it.
+- `dist_to_near_baseline + court_x` is camera-invariant → helps LU (0.085→0.149),
+  helps 18dda9d2 precision, never hurts. **This is the feature set to adopt.**
+
+**Caveats:** (1) absolute LU serve recall stays poor (0.149) — LU is the only
+LU venue; features can't substitute for venue diversity. (2) run-to-run noise
+~5 pts (stochastic training); only the LU delta and the geometric argument are
+reliable. The dominant lever remains more venue diversity in training.
+
+**Recommendation:** use `dist_to_near_baseline` + `court_x` (NOT court_y) as
+two extra TCN channels in the next training. At inference, append them per
+frame from `players_reid.csv` (court_x, and min(court_y, 20-court_y)). Treat
+as a modest, robust improvement — not a generalization fix.
