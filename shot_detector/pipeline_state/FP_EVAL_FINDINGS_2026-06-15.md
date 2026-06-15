@@ -118,3 +118,38 @@ reliable. The dominant lever remains more venue diversity in training.
 two extra TCN channels in the next training. At inference, append them per
 frame from `players_reid.csv` (court_x, and min(court_y, 20-court_y)). Treat
 as a modest, robust improvement — not a generalization fix.
+
+## ROOT CAUSE of LU failure: VFR frame misalignment (2026-06-15)
+
+Carlos's "LU looks wrong" was correct — but it's NOT the court positions
+(those are fine). It's **temporal frame misalignment** from variable frame
+rate (VFR).
+
+Visual proof (sequential-decode frame strips around annotated smashes,
+cropped on the active player, ball overlaid):
+- 18dda9d2 (CFR 30): smash contact at annotation offset ~0 — ALIGNED.
+- 0529 (VFR 250/30.10): contact ~3-6 frames before the annotation (late
+  video) — mildly off, still inside the +-15 window.
+- 22-11 LU (VFR 250/30.005): contact at ~-12 early, worse later, and the
+  late-video smash shows NO swing in +-12 — BADLY misaligned.
+
+The LU video also has a 0.32s startup gap (frame 1 pts = 0.320s, ~9 missing
+frames). So `poses_raw` (sequential decode) and the annotations (made on a
+constant-30fps timeline) drift apart. Every LU shot is extracted at the wrong
+frame → the 30-frame window captures follow-through, not the swing → garbage
+training data → LU model collapse (serve recall 0.085). Court features were a
+red herring; the data was corrupt.
+
+VFR videos: `0529 BO-0001/BO-0002`, `22-11 LU-0002` (all r_frame_rate=250).
+CFR videos: `15-11`, `18dda9d2`, `a145dd19` (r=30).
+
+## Fix in progress
+
+Converting the 3 VFR videos to true CFR 30 (`ffmpeg -fps_mode cfr -r 30`,
+output in `/home/ec2-user/data/matches/cfr/` with original basenames). ffmpeg
+fills the startup gap (dup=9) + resamples to constant 30, so the re-run
+pipeline frames will match the annotation timeline. Carlos re-runs the
+pipeline (poses_raw etc.) on the CFR videos, then re-extract + retrain.
+Expect a large LU improvement and a modest 0529 improvement.
+
+**Until LU is re-aligned, exclude it from training** (it corrupts the model).
