@@ -75,8 +75,11 @@ PLAYERS_REID_MAP = {
     '15-11-2025-15-57_rpi-BO-0001': {
         'BO-0001': '15-11-2025-15-57_rpi-BO-0001/BO-0001/players_reid.csv',
     },
+    # LU-0002 is VFR and its annotations align with the CFR re-encode (verified
+    # 2026-06-16). Use the stats-poc CFR re-processing (absolute path), NOT the
+    # OG LookAtMeProtoApp VFR data. (0529, by contrast, aligns with OG/VFR.)
     '22-11-2025-18-10_rpi-LU-0002': {
-        'LU-0002': '22-11-2025-18-10_rpi-LU-0002/LU-0002/players_reid.csv',
+        'LU-0002': '/home/ec2-user/carlos/stats-poc/data/intermediate/22-11-2025-18-10_rpi-LU-0002/LU-0002/players_reid.csv',
     },
     '18dda9d2-baba-4920-a642-d0a9838d01f3': {
         'BO-2226': '18dda9d2-baba-4920-a642-d0a9838d01f3/BO-2226/players_reid.csv',
