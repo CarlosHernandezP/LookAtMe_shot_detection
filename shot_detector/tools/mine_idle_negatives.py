@@ -137,11 +137,12 @@ def main():
             candidates = [pid for pid, cov in sorted(pid_cov.items(), key=lambda kv: -kv[1])
                           if cov >= args.min_coverage][:2]
             for pid in candidates:
-                seq, court = [], []
+                seq, court, vis = [], [], []
                 last, miss = None, 0
                 for fr in range(start, start + WINDOW_LEN):
                     court.append(_court_xy(reid_by_frame, fr, pid))
                     p = pose_at(fr, pid)
+                    vis.append(1 if p is not None else 0)
                     if p is not None:
                         last, miss = p, 0
                     elif last is not None and miss < MAX_FORWARD_FILL:
@@ -160,7 +161,7 @@ def main():
                     out = os.path.join(args.output_dir, f"{video_name}_{c + 1}_idle_{side}_pose.csv")
                 save_pose_csv(seq, out, image_width=img_w, image_height=img_h,
                               ball_positions=None, start_frame=start)
-                append_court_columns(out, court)
+                append_court_columns(out, court, vis)
                 totals["samples"] += 1
         totals["windows"] += len(centers)
 

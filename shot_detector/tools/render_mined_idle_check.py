@@ -39,14 +39,18 @@ VIDEOS_DIR = "/home/ec2-user/data/matches"
 NAME_RE = re.compile(r"^(?P<video>.+)_(?P<center>\d+)_idle_(?P<side>left|right)_pose\.csv$")
 
 
-def video_file_for(video_name: str):
-    """Mined names carry the annotation stem (may include _period<N> / _<N> suffix)."""
-    base = re.sub(r"_period\d+$", "", video_name)
-    base = re.sub(r"_\d$", "", base)
-    for ext in (".mp4", ".MP4", ".mov", ".avi"):
-        p = os.path.join(VIDEOS_DIR, base + ext)
-        if os.path.exists(p):
-            return p
+def video_for_intermediate(reid_path: str):
+    """Use the exact video the intermediate was processed from (video_metadata
+    .json source_path) so the overlay matches — CFR video for LU, OG for 0529."""
+    import json
+    meta = os.path.join(os.path.dirname(reid_path), "video_metadata.json")
+    if os.path.exists(meta):
+        try:
+            src = json.load(open(meta)).get("source_path")
+            if src and os.path.exists(src):
+                return src
+        except Exception:
+            pass
     return None
 
 
@@ -75,12 +79,13 @@ def main():
         if not mk:
             print(f"WARN no map for {video_name}")
             continue
-        video_path = video_file_for(video_name)
-        if not video_path:
-            print(f"WARN no video for {video_name}")
-            continue
-        reid_path = os.path.join(PLAYERS_REID_ROOT, PLAYERS_REID_MAP[mk][cam])
+        reid_rel = PLAYERS_REID_MAP[mk][cam]
+        reid_path = reid_rel if os.path.isabs(reid_rel) else os.path.join(PLAYERS_REID_ROOT, reid_rel)
         poses_raw_path = os.path.join(os.path.dirname(reid_path), "poses_raw.csv")
+        video_path = video_for_intermediate(reid_path)
+        if not video_path:
+            print(f"WARN no source video for {video_name} ({reid_path})")
+            continue
         frames_needed = set()
         for c, _, _ in picks:
             s = max(0, c - WINDOW_BEFORE)

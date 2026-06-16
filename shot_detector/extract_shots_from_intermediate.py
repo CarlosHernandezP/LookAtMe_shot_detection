@@ -44,11 +44,12 @@ def _court_xy(reid_by_frame, fr, pid):
     return float("nan"), float("nan")
 
 
-def append_court_columns(csv_path, court_seq):
+def append_court_columns(csv_path, court_seq, vis_seq=None):
     """
-    Append court_x, court_y, dist_to_near_baseline columns to a saved pose CSV.
-    court_seq is a list of (court_x, court_y) per frame, aligned with the CSV rows
-    (forward-filled to match the pose forward-fill). NaN where unavailable.
+    Append court_x, court_y, dist_to_near_baseline (+ optional pose_visible)
+    columns to a saved pose CSV. court_seq is a list of (court_x, court_y) per
+    frame; vis_seq is a list of 1/0 per frame (1 = a real pose was detected that
+    frame, 0 = forward-filled or missing). Aligned with the CSV rows.
     """
     import numpy as np
     df = pd.read_csv(csv_path)
@@ -61,6 +62,8 @@ def append_court_columns(csv_path, court_seq):
     df["court_x"] = s_cx.to_numpy()
     df["court_y"] = s_cy.to_numpy()
     df["dist_to_near_baseline"] = np.minimum(s_cy.to_numpy(), COURT_LENGTH_M - s_cy.to_numpy())
+    if vis_seq is not None:
+        df["pose_visible"] = np.array([int(v) for v in vis_seq[:n]], dtype=float)
     df.to_csv(csv_path, index=False)
 
 from shot_detector.extract_shots import (
@@ -254,6 +257,7 @@ def main():
 
             active_seq, idle_seq = [], []
             active_court, idle_court = [], []
+            active_vis, idle_vis = [], []
             last_a = last_i = None
             miss_a = miss_i = 0
             for i, fr in enumerate(range(start, start + WINDOW_LEN)):
@@ -262,6 +266,7 @@ def main():
                 idle_court.append(_court_xy(reid_by_frame, fr, idle_pid) if idle_pid is not None else (float("nan"), float("nan")))
 
                 pa = pose_at(fr, active_pid)
+                active_vis.append(1 if pa is not None else 0)  # before forward-fill
                 if pa is not None:
                     last_a, miss_a = pa, 0
                 elif last_a is not None and miss_a < MAX_FORWARD_FILL:
@@ -271,6 +276,7 @@ def main():
                 active_seq.append(mirror_coco_pose_horizontal(copy.deepcopy(pa), img_w) if (pa and ma) else pa)
 
                 pi = pose_at(fr, idle_pid) if idle_pid is not None else None
+                idle_vis.append(1 if pi is not None else 0)
                 if pi is not None:
                     last_i, miss_i = pi, 0
                 elif last_i is not None and miss_i < MAX_FORWARD_FILL:
@@ -299,13 +305,13 @@ def main():
             save_pose_csv(active_seq, active_path,
                           image_width=img_w, image_height=img_h,
                           ball_positions=ball_positions or None, start_frame=start)
-            append_court_columns(active_path, active_court)
+            append_court_columns(active_path, active_court, active_vis)
             if any(p is not None for p in idle_seq):
                 idle_path = os.path.join(args.output_dir, f"{video_name}_{center}_idle_{label}_pose.csv")
                 save_pose_csv(idle_seq, idle_path,
                               image_width=img_w, image_height=img_h,
                               ball_positions=ball_positions or None, start_frame=start)
-                append_court_columns(idle_path, idle_court)
+                append_court_columns(idle_path, idle_court, idle_vis)
             totals["exported"] += 1
             totals["with_ball"] += bool(ball_positions)
 
