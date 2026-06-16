@@ -94,10 +94,36 @@ def main():
     reid_by_frame = load_players_reid_by_frame(f"{args.intermediate}/players_reid.csv")
     poses = load_poses_for_frames(f"{args.intermediate}/poses_raw.csv", frames_needed)
 
-    # active player_id locked per shot at its contact frame
+    # LOCAL players only: reid has ~4 players (whole court) but only the ~2
+    # close-to-camera players have a pose in poses_raw. The shot annotations
+    # refer to a local player, and the training extraction picks among the
+    # top-2 by pose coverage. Mirror that here so the montage verifies the
+    # training selection (not a far player).
+    def local_pids(start, end):
+        cov = {}
+        for fr in range(start, end + 1):
+            present = poses.get(fr, {})
+            for r in reid_by_frame.get(fr, []):
+                if r["object_id"] in present:
+                    cov[r["player_id"]] = cov.get(r["player_id"], 0) + 1
+        return [pid for pid, _ in sorted(cov.items(), key=lambda kv: -kv[1]) if _ > 0][:2]
+
     active_pid_for = {}
+    local_pids_for = {}
     for w in windows:
-        active_pid_for[w[2]] = pick_active(reid_by_frame.get(w[2], []), w[4])
+        loc = local_pids(w[0], w[1])
+        local_pids_for[w[2]] = set(loc)
+        recs_local = [r for r in reid_by_frame.get(w[2], []) if r["player_id"] in loc]
+        if not recs_local:
+            # no reid at exact contact for locals -> nearest frame within window
+            for off in range(1, POST + 1):
+                for fr in (w[2] - off, w[2] + off):
+                    recs_local = [r for r in reid_by_frame.get(fr, []) if r["player_id"] in loc]
+                    if recs_local:
+                        break
+                if recs_local:
+                    break
+        active_pid_for[w[2]] = pick_active(recs_local, w[4])
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -116,7 +142,10 @@ def main():
             break
         w = aw[0]
         act_pid = active_pid_for[w[2]]
+        local = local_pids_for[w[2]]
         for r in reid_by_frame.get(fn, []):
+            if r["player_id"] not in local:  # draw LOCAL (close-pair) players only
+                continue
             is_act = r["player_id"] == act_pid
             col = (0, 0, 255) if is_act else (0, 200, 0)
             th = 3 if is_act else 1
