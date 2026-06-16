@@ -63,3 +63,25 @@ with the earlier LOO generalization finding.
 3. Untried but promising (next): contact-frame-centered windows (tighter shot
    windows), a two-stage binary shot-detector + type-classifier (lets you tune
    inflation independently of type accuracy), 5-fold ensemble at inference.
+
+## Segmenter-hardening study (2026-06-16)
+
+Full-match harness (production path: predict_shots -> smooth -> segment) with a
+TCN on held-out 18dda9d2 (891 annotated shots, 113 serves). Current
+`find_shot_segments` vs `find_shot_segments_hardened(min_windows, min_peak_confidence)`:
+
+| config | emitted | inflation | overall P/R | serve P/R |
+|---|---|---|---|---|
+| current (mw1,cf0) | 1520 | 1.71x | 0.53 / 0.90 | 0.77 / 0.91 |
+| mw2,cf0 | 1129 | 1.27x | 0.60 / 0.76 | 0.84 / 0.73 |
+| mw2,cf0.5 | 949 | 1.07x | 0.65 / 0.69 | 0.90 / 0.69 |
+| mw2,cf0.6 | 663 | 0.74x | 0.72 / 0.53 | 0.94 / 0.55 |
+| mw3,cf0.6 | 521 | 0.58x | 0.71 / 0.41 | 0.94 / 0.41 |
+
+Hardening is a clean inflation<->recall dial: mw2,cf0.5 brings the count from
+1.71x to 1.07x (near-exact), overall precision 0.53->0.65, serve precision
+0.77->0.90, at a recall cost (0.90->0.69). Caveats: annotations incomplete ->
+precision is a LOWER bound (true precision higher, inflation overstated);
+study model (tcn_fixed_lu, 41-feat) trained incl 18dda9d2 -> absolute numbers
+optimistic, relative hardening effect robust. Recommended deploy default:
+mw2, cf~0.5 (count-accurate), tune per deployment.
