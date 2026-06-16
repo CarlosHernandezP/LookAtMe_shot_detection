@@ -32,6 +32,28 @@ could we be doing" / "ways to improve". Ranked by expected value.
 4. **5-fold ensemble at inference.** Average the 5 CV fold models. Cheap,
    typically +1-2 f1, also smooths confidence (helps thresholding).
 
+## Performance: store poses_raw as PARQUET (verified 122x faster)
+
+`poses_raw.csv` stores keypoints as stringified nested lists; parsing them
+(`json.loads`, already 5x better than `ast.literal_eval`) is the dominant cost
+of every reader (~8s per file). Benchmarked parquet with keypoints as 34 float
+columns (`k0..k33`, reshape to (N,17,2)):
+
+- read+to-matrix: **0.06s vs 7.8s json = 122x faster**
+- file size: **65 MB vs 227 MB CSV = 3.5x smaller**
+
+**TODO (do this — it clearly verifies faster):**
+1. Install `pyarrow` properly (`uv add pyarrow`). NOTE: it was pip-installed
+   ad-hoc in the stats-poc venv for the benchmark; make it a real dependency.
+2. In the pipeline that WRITES `poses_raw` (ProtoApp/stats-poc), also/instead
+   write `poses_raw.parquet` with keypoints as 34 float columns + frame_num +
+   track_id (not stringified lists).
+3. Update EVERY reader of `poses_raw.csv` to prefer the parquet:
+   - `stats-poc/src/shot_detection/shot_predictor.py::_load_poses_lookup`
+   - `LookAtMe shot_detector/extract_shots_from_intermediate.py::load_poses_for_frames`
+   - `tools/mine_idle_negatives.py`, `tools/verify_*`, `tools/render_*`
+   Keep a CSV fallback for old matches not yet re-exported.
+
 ## Smaller / supporting
 
 5. **Richer ball features** (post-contact trajectory direction, bounce depth)
